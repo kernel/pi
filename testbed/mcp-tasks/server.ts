@@ -16,6 +16,9 @@
  * - `required_task_job`: task only. Without the capability: JSON-RPC error -32021.
  * - `ask_name`: task that moves to `input_required` with an elicitation input request, and
  *   completes after `tasks/update`. Task only.
+ * - `confirm_delete`: not a task. On 2026-07-28 it first answers with an `input_required` result
+ *   (a multi-round-trip request asking for confirmation) and completes when the client retries with
+ *   `inputResponses`. 2025-era clients get an inline result.
  *
  * Usage: node server.ts             stdio
  *        node server.ts --http 3939 Streamable HTTP at http://127.0.0.1:3939/mcp
@@ -163,7 +166,7 @@ function startAskNameTask(): TaskRecord {
 type JsonRpcRequest = { jsonrpc: "2.0"; id: string | number; method: string; params?: Record<string, unknown> };
 type JsonRpcResponse = { jsonrpc: "2.0"; id: string | number } & ({ result: unknown } | { error: JsonRpcError });
 
-const TASK_TOOLS = new Set(["slow_job", "required_task_job", "ask_name"]);
+const INTERCEPTED_TOOLS = new Set(["slow_job", "required_task_job", "ask_name", "confirm_delete"]);
 
 const missingCapability: JsonRpcError = {
 	code: -32021,
@@ -192,7 +195,7 @@ function interceptTasks(message: unknown): Promise<JsonRpcResponse> | undefined 
 	if (!isRequest(message)) return undefined;
 	const { id, method, params } = message;
 	const toolName = method === "tools/call" ? params?.name : undefined;
-	if (!method.startsWith("tasks/") && !(typeof toolName === "string" && TASK_TOOLS.has(toolName))) return undefined;
+	if (!method.startsWith("tasks/") && !(typeof toolName === "string" && INTERCEPTED_TOOLS.has(toolName))) return undefined;
 	log(`intercepted ${method}${toolName ? ` ${toolName}` : ""} (tasks declared: ${declaresTasks(params)})`);
 	const respond = async (): Promise<JsonRpcResponse> => {
 		try {
@@ -208,13 +211,33 @@ async function answer(method: string, toolName: string | undefined, params: Reco
 	const withTasks = declaresTasks(params);
 	if (method === "tools/call") {
 		const args = (params.arguments ?? {}) as Record<string, unknown>;
+		const modern = typeof (params._meta as Record<string, unknown> | undefined)?.[PROTOCOL_VERSION] === "string";
+		if (toolName === "confirm_delete") {
+			if (!modern) return text("deleted (2025-era clients are not asked to confirm)");
+			const response = (params.inputResponses as Record<string, { action?: string }> | undefined)?.confirm;
+			if (!response) {
+				return {
+					resultType: "input_required",
+					inputRequests: {
+						confirm: {
+							method: "elicitation/create",
+							params: {
+								mode: "form",
+								message: "Really delete?",
+								requestedSchema: { type: "object", properties: {} },
+							},
+						},
+					},
+				};
+			}
+			return { resultType: "complete", ...text(response.action === "accept" ? "deleted" : "kept", false) };
+		}
 		const seconds = typeof args.seconds === "number" ? args.seconds : 3;
 		if (toolName === "slow_job") {
 			if (withTasks) return taskView(startSlowTask(seconds, args.fail), "task");
 			await sleep(seconds * 1000);
 			const outcome = slowJobOutcome(seconds, args.fail);
 			if ("error" in outcome) throw outcome.error;
-			const modern = typeof (params._meta as Record<string, unknown> | undefined)?.[PROTOCOL_VERSION] === "string";
 			return modern ? { resultType: "complete", ...outcome.result } : outcome.result;
 		}
 		if (!withTasks) throw missingCapability;
@@ -313,6 +336,15 @@ function buildServer(ctx: McpRequestContext): McpServer {
 		{
 			description: "Like slow_job, but only runs as a task. Clients without the tasks extension get error -32021.",
 			inputSchema: z.object({ seconds: z.number().min(0).max(600).default(3) }),
+		},
+		unreachable,
+	);
+	server.registerTool(
+		"confirm_delete",
+		{
+			description:
+				"Asks for confirmation through a multi-round-trip input request (2026-07-28), then reports what happened.",
+			inputSchema: z.object({}),
 		},
 		unreachable,
 	);

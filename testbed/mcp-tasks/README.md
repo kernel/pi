@@ -29,6 +29,7 @@ Task transitions are logged to stderr, and appended to `$TESTBED_LOG` when it is
 | `slow_job` (`seconds`, `fail?: "tool" \| "protocol"`) | blocks, then result | task, polled to `completed` or `failed` |
 | `required_task_job` (`seconds`) | error -32021 | task |
 | `ask_name` | error -32021 | task that goes `input_required` (elicitation), completes after `tasks/update` |
+| `confirm_delete` | result | 2026-07-28 clients first get an `input_required` result asking for confirmation, and the result when they retry with `inputResponses` |
 
 Over HTTP the server also checks the `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name` headers of the requests it intercepts; the SDK checks the others.
 

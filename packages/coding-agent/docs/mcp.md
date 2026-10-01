@@ -56,6 +56,7 @@ HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#a
 Both server types support:
 
 - `timeout`: per-request timeout in seconds (default 60). Progress notifications reset it.
+- `protocolVersion: "2026-07-28"`: connect with the stateless 2026-07-28 revision instead of the `initialize` handshake, and let the server answer tool calls with tasks (the Tasks extension), which pi polls to completion. The server must support the revision; there is no fallback. Servers that ask for input (`input_required`, task input requests) are not supported yet, and the tool list is not refreshed when it changes.
 - `enabled: false`: keep the entry without connecting to it.
 - `exposure` and `toolExposure`: control how tools reach the model (see [Control tool exposure](#control-tool-exposure)).
 - `description`: what the server offers, in a sentence. It lists the server in the system prompt (see [Control tool exposure](#control-tool-exposure)), tool search ranks the server's tools by it, and codemode's `describeNamespace()` returns it. Without it, the first line of the server instructions is used once the server connects.

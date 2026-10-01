@@ -28,6 +28,7 @@ const calls = {
 	slow_job_protocol_error: () => tools.mcp__testbed__slow_job({ seconds: 1, fail: "protocol" }),
 	required_task_job: () => tools.mcp__testbed__required_task_job({ seconds: 1 }),
 	ask_name: () => tools.mcp__testbed__ask_name({}),
+	confirm_delete: () => tools.mcp__testbed__confirm_delete({}),
 };
 const report = {};
 for (const [name, call] of Object.entries(calls)) {
@@ -100,6 +101,10 @@ describe.skipIf(!installed)("MCP Tasks extension testbed", () => {
 		expect(report.slow_job).toEqual({ ok: true, isError: false, text: "slow_job finished after 1s" });
 		expect(report.required_task_job).toMatchObject({ ok: false });
 		expect(report.ask_name).toMatchObject({ ok: false });
+		expect(report.confirm_delete).toMatchObject({
+			ok: true,
+			text: "deleted (2025-era clients are not asked to confirm)",
+		});
 	}, 30_000);
 
 	for (const transport of ["stdio", "http"] as const) {
@@ -117,6 +122,11 @@ describe.skipIf(!installed)("MCP Tasks extension testbed", () => {
 			expect(report.required_task_job).toEqual({ ok: true, isError: false, text: "slow_job finished after 1s" });
 			// pi cannot answer input requests yet: the task is cancelled and the call rejects.
 			expect(report.ask_name).toMatchObject({ ok: false, error: expect.stringContaining("needs input (name)") });
+			// Neither can it answer multi-round-trip input requests: the call rejects instead of resolving to an empty result.
+			expect(report.confirm_delete).toMatchObject({
+				ok: false,
+				error: expect.stringContaining("needs input to answer tools/call (confirm)"),
+			});
 		}, 30_000);
 	}
 });

@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import {
 	type AuthProvider,
 	type CallToolResult,
+	createTasksExtension,
 	JSON_RPC_ERROR_CODES,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
@@ -27,7 +28,6 @@ import {
 	STATELESS_PROTOCOL_VERSION,
 	StdioTransport,
 	StreamableHttpTransport,
-	TASKS_EXTENSION,
 } from "@earendil-works/pi-mcp";
 import { McpOAuthAuthorizationRequiredError, type OAuthChallenge } from "@earendil-works/pi-mcp/oauth";
 import { VERSION } from "../../config.ts";
@@ -377,10 +377,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			version: VERSION,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
-			// McpClient.callTool() polls the tasks a server answers with, so tools stay synchronous.
-			...(stateless
-				? { protocolVersion: STATELESS_PROTOCOL_VERSION, capabilities: { extensions: { [TASKS_EXTENSION]: {} } } }
-				: {}),
+			// The Tasks extension polls the tasks a server answers with, so tool calls stay synchronous.
+			...(stateless ? { protocolVersion: STATELESS_PROTOCOL_VERSION, extensions: [createTasksExtension()] } : {}),
 		});
 		const log = this.log;
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));
