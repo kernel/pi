@@ -24,8 +24,10 @@ import {
 	type ReadResourceResult,
 	type Resource,
 	type ResourceTemplate,
+	STATELESS_PROTOCOL_VERSION,
 	StdioTransport,
 	StreamableHttpTransport,
+	TASKS_EXTENSION,
 } from "@earendil-works/pi-mcp";
 import { McpOAuthAuthorizationRequiredError, type OAuthChallenge } from "@earendil-works/pi-mcp/oauth";
 import { VERSION } from "../../config.ts";
@@ -369,11 +371,16 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async connectOnce(): Promise<McpClient> {
+		const stateless = this.entry.config.protocolVersion === STATELESS_PROTOCOL_VERSION;
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
+			// McpClient.callTool() polls the tasks a server answers with, so tools stay synchronous.
+			...(stateless
+				? { protocolVersion: STATELESS_PROTOCOL_VERSION, capabilities: { extensions: { [TASKS_EXTENSION]: {} } } }
+				: {}),
 		});
 		const log = this.log;
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));

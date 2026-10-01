@@ -1,0 +1,15 @@
+{
+	"name": "mcp-tasks-testbed",
+	"private": true,
+	"type": "module",
+	"description": "Local MCP server implementing the 2026-07-28 Tasks extension, for testing pi's MCP client",
+	"scripts": {
+		"start": "node server.ts",
+		"start:http": "node server.ts --http 3939",
+		"probe": "node probe.ts modern && node probe.ts legacy"
+	},
+	"dependencies": {
+		"@modelcontextprotocol/server": "2.2.0",
+		"zod": "4.6.5"
+	}
+}

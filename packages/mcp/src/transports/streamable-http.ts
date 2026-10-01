@@ -2,6 +2,7 @@ import type { AuthProvider, McpFetch } from "../auth-provider.ts";
 import {
 	isJsonRpcRequest,
 	isJsonRpcResponse,
+	isObject,
 	JSON_RPC_ERROR_CODES,
 	type JsonRpcId,
 	type JsonRpcMessage,
@@ -9,6 +10,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { STATELESS_PROTOCOL_VERSION } from "../protocol/types.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
 
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
@@ -16,6 +18,25 @@ const ERROR_MESSAGE_BODY_CHARS = 500;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS = 30_000;
 const DEFAULT_RECONNECT_MAX_RETRIES = 5;
+/** The request field the `Mcp-Name` header mirrors on the stateless protocol revision, by method. */
+const MCP_NAME_SOURCES: Record<string, string> = {
+	"tools/call": "name",
+	"prompts/get": "name",
+	"resources/read": "uri",
+	"tasks/get": "taskId",
+	"tasks/update": "taskId",
+	"tasks/cancel": "taskId",
+};
+
+/**
+ * `Mcp-Name` value: header-safe strings as they are, others as `=?base64?<utf-8 base64>?=`.
+ * Header-safe means non-empty, no surrounding whitespace, and only visible ASCII, space, or tab.
+ */
+function encodeHeaderValue(value: string): string {
+	const safe =
+		value.length > 0 && value === value.trim() && /^[\t\x20-\x7e]*$/.test(value) && !/^=\?base64\?.*\?=$/.test(value);
+	return safe ? value : `=?base64?${btoa(String.fromCharCode(...new TextEncoder().encode(value)))}?=`;
+}
 
 export interface SseEvent {
 	event?: string;
@@ -223,7 +244,11 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	async send(message: JsonRpcMessage): Promise<void> {
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
 		const response = await this.authorizedFetch("POST", {
-			headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				...this.routingHeaders(message),
+			},
 			body: JSON.stringify(message),
 		});
 		await this.checkResponse(response);
@@ -298,6 +323,17 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 				await discard(response);
 			}
 		}
+	}
+
+	/** `Mcp-Method` and `Mcp-Name`, which the stateless protocol revision requires on requests. */
+	private routingHeaders(message: JsonRpcMessage): Record<string, string> {
+		if (this.protocolVersion !== STATELESS_PROTOCOL_VERSION || !isJsonRpcRequest(message)) return {};
+		const source = MCP_NAME_SOURCES[message.method];
+		const name = source !== undefined && isObject(message.params) ? message.params[source] : undefined;
+		return {
+			"Mcp-Method": message.method,
+			...(typeof name === "string" ? { "Mcp-Name": encodeHeaderValue(name) } : {}),
+		};
 	}
 
 	private async headers(extra: Record<string, string> = {}): Promise<{ headers: Headers; token?: string }> {

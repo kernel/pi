@@ -9,6 +9,16 @@ export const LATEST_PROTOCOL_VERSION = "2025-11-25";
 export const SUPPORTED_PROTOCOL_VERSIONS = [LATEST_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05"] as const;
 export type SupportedProtocolVersion = (typeof SUPPORTED_PROTOCOL_VERSIONS)[number];
 
+/**
+ * The stateless protocol revision: `server/discover` replaces `initialize`, and every request carries
+ * the client's protocol version, info, and capabilities in its `_meta` envelope. Opt-in, with no
+ * fallback to `initialize`.
+ */
+export const STATELESS_PROTOCOL_VERSION = "2026-07-28";
+
+/** The Tasks extension: a server may answer `tools/call` with a task handle to poll. */
+export const TASKS_EXTENSION = "io.modelcontextprotocol/tasks";
+
 export interface Implementation {
 	name: string;
 	version: string;
@@ -25,10 +35,13 @@ export interface ClientCapabilities {
 	roots?: { listChanged?: boolean };
 	sampling?: Record<string, unknown>;
 	elicitation?: Record<string, unknown>;
+	/** Extension identifiers (such as {@link TASKS_EXTENSION}) mapped to their settings. */
+	extensions?: Record<string, Record<string, unknown>>;
 }
 
 export interface ServerCapabilities {
 	experimental?: Record<string, unknown>;
+	extensions?: Record<string, Record<string, unknown>>;
 	logging?: Record<string, unknown>;
 	prompts?: { listChanged?: boolean };
 	resources?: { subscribe?: boolean; listChanged?: boolean };
@@ -47,6 +60,33 @@ export interface InitializeResult {
 	capabilities: ServerCapabilities;
 	serverInfo: Implementation;
 	instructions?: string;
+}
+
+/** Result of `server/discover`, the stateless revision's replacement for `initialize`. */
+export interface DiscoverResult {
+	supportedVersions: string[];
+	capabilities: ServerCapabilities;
+	instructions?: string;
+	_meta?: { "io.modelcontextprotocol/serverInfo"?: Implementation };
+}
+
+export type TaskStatus = "working" | "input_required" | "completed" | "failed" | "cancelled";
+
+/**
+ * A task of the Tasks extension, as `tasks/get` returns it. `result` is set when `completed`,
+ * `error` when `failed`, and `inputRequests` when `input_required`.
+ */
+export interface Task {
+	taskId: string;
+	status: TaskStatus;
+	statusMessage?: string;
+	createdAt: string;
+	lastUpdatedAt: string;
+	ttlMs: number | null;
+	pollIntervalMs?: number;
+	result?: Record<string, unknown>;
+	error?: { code: number; message: string; data?: unknown };
+	inputRequests?: Record<string, unknown>;
 }
 
 export interface ProgressNotification {

@@ -40,6 +40,11 @@ interface McpServerConfigBase {
 	enabled?: boolean;
 	/** Per-request timeout in seconds. Progress notifications from the server reset it. Default: 60. */
 	timeout?: number;
+	/**
+	 * `"2026-07-28"` connects with the stateless revision (`server/discover`, no `initialize`) and lets
+	 * the server answer tool calls with tasks. Default: the `initialize` handshake.
+	 */
+	protocolVersion?: "2026-07-28";
 }
 
 export interface McpStdioServerConfig extends McpServerConfigBase {
@@ -206,7 +211,7 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	if (!SERVER_NAME.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
 	if (!isRecord(raw)) return `server "${name}" must be an object`;
 	const value = resolveExposureAliases(raw);
-	const { type, exposure, enabled, timeout, toolExposure, description } = value;
+	const { type, exposure, enabled, timeout, toolExposure, description, protocolVersion } = value;
 	const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
 	if (exposure !== undefined && !isExposure(exposure)) {
 		return `server "${name}": exposure must be one of ${exposures}`;
@@ -223,6 +228,9 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	}
 	if (timeout !== undefined && (typeof timeout !== "number" || !(timeout > 0))) {
 		return `server "${name}": timeout must be a positive number of seconds`;
+	}
+	if (protocolVersion !== undefined && protocolVersion !== "2026-07-28") {
+		return `server "${name}": protocolVersion must be "2026-07-28"`;
 	}
 	if (type === "sse") return `server "${name}": legacy SSE transport is not supported; use the streamable HTTP URL`;
 
