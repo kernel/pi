@@ -16,6 +16,7 @@
 
 ### Added
 
+- `PostgresStorage` in `@earendil-works/pi-durable/storage/postgres`: Sessions in a Postgres schema over a caller-owned pool such as `pg.Pool`, with a per-Session advisory lock and an owner token checked by every commit. The package adds no runtime dependency.
 - `CodingTools` extension in `@earendil-works/pi-durable/tools` with `read`, `write`, `edit`, and `bash`.
 - `AgentDoc`, `configure()`, `DEFAULT_RETRY_POLICY`, and `DEFAULT_COMPACTION_POLICY` exports.
 - `HarnessOptions.conversationCreated(tx, conversation)` runs in every commit that creates or forks a conversation, after the built-in documents, so applications can create their own documents in every conversation.
