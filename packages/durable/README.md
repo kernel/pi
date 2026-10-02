@@ -523,8 +523,9 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 | Memory | `MemoryStorage` from the package root | Nothing is persisted. |
 | SQLite | `openNodeSqliteStorage(file)` from `@earendil-works/pi-durable/storage/sqlite/node` | One database file. WAL mode with `synchronous = NORMAL`: commits survive process crashes; the newest may be lost on power or host failure. |
 | JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. |
+| Postgres | `PostgresStorage.open(pool, { session })` from `@earendil-works/pi-durable/storage/postgres` | One Session per `session` name; many Sessions share one schema. Locked to one process. |
 
-One process owns a storage at a time; there is no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
+One process owns a storage at a time; SQLite and JSONL do no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
 
 SQLite adapters implement promise-based `exec`, `run`, `get`, `all`, `transaction`, and `close`. `run`, `get`, and `all` take SQL text plus positional bindings; adapters may cache prepared statements by SQL text. A transaction callback receives a transaction handle; all work in the transaction must use it, and the handle expires when the callback settles. Adapters must queue unrelated operations and other transactions until the transaction finishes, so calling `database` itself inside the callback never settles:
 
@@ -533,6 +534,16 @@ await database.transaction(async (transaction) => {
 	await transaction.exec("CREATE TABLE example (value TEXT)");
 	await transaction.run("INSERT INTO example (value) VALUES (?)", "stored atomically");
 });
+```
+
+Postgres storage runs on a pool you create and own; a `pg.Pool` fits as is, and this package imports no driver. The first open creates the `pi_durable` schema (or `schema`) and its tables. Each storage keeps one pooled client checked out to hold its Session's advisory lock, so give the pool at least two connections. A second open of a held Session rejects. Every commit also checks the owner token written by the latest open, so a process that lost its lock can no longer write. Requires Postgres 11 or newer.
+
+```typescript
+import pg from "pg";
+import { PostgresStorage } from "@earendil-works/pi-durable/storage/postgres";
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
+const harness = await Harness.open(await PostgresStorage.open(pool, { session: "support-bot" }), { models, registry }, context);
 ```
 
 Custom backends can run the shared conformance suite with any Vitest- or Jest-compatible runner:
@@ -589,6 +600,8 @@ Examples that call OpenAI need `OPENAI_API_KEY`; most use the faux provider othe
 - [`docs/pico-v5.md`](docs/pico-v5.md): the normative specification
 - [`docs/pico-v5-handoff.md`](docs/pico-v5-handoff.md): the implementation plan
 - [`docs/pico-v5-chord-usage.md`](docs/pico-v5-chord-usage.md): how the package uses Chord
+
+Postgres storage tests run when `PI_DURABLE_POSTGRES_URL` names a database they may create and drop schemas in; otherwise they are skipped.
 
 Benchmarks: `npm run bench:storage`, `npm run bench:storage:memory`, and `npm run bench:tool-output`.
 

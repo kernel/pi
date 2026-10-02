@@ -28,6 +28,14 @@ describe("durable storage runtime boundaries", () => {
 		expect([...graph].some((path) => path.includes("/env/"))).toBe(false);
 		expect([...graph].some((path) => path.includes("/storage/jsonl/"))).toBe(false);
 		expect([...graph].some((path) => path.includes("/storage/sqlite/"))).toBe(false);
+		expect([...graph].some((path) => path.includes("/storage/postgres/"))).toBe(false);
+	});
+
+	it("keeps the Postgres subpath free of Node imports and drivers", async () => {
+		const graph = await sourceGraph("storage/postgres/index.ts");
+		for (const path of graph) {
+			expect(await readFile(path, "utf8"), `${path} imports a driver`).not.toMatch(/from\s+["']pg["']/);
+		}
 	});
 
 	it("keeps the portable SQLite subpath free of Node imports", async () => {
