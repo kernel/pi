@@ -27,7 +27,7 @@ import {
 	McpServerConnection,
 	McpServerLog,
 } from "../src/extensions/mcp/runtime.ts";
-import { convertMcpResult, createMcpToolName } from "../src/extensions/mcp/tools.ts";
+import { convertMcpResult, createMcpToolDefinition, createMcpToolName } from "../src/extensions/mcp/tools.ts";
 
 // Config values are resolved at connect time, so the literal reference must survive loading.
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal config value reference
@@ -83,6 +83,27 @@ describe("MCP config", () => {
 		// Untrusted projects cannot add or override servers, since stdio servers run commands.
 		const untrusted = loadMcpConfig({ ...paths, projectTrusted: false });
 		expect(untrusted.servers.find((server) => server.name === "shared")?.config).toEqual({ command: "global-cmd" });
+	});
+
+	it("accepts a positive integer maxOutputBytes", () => {
+		const paths = setup(
+			{
+				mcpServers: {
+					big: { command: "x", maxOutputBytes: 100_000 },
+					zero: { command: "x", maxOutputBytes: 0 },
+					fraction: { command: "x", maxOutputBytes: 1.5 },
+				},
+			},
+			{},
+		);
+		const config = loadMcpConfig({ ...paths, projectTrusted: false });
+		expect(config.servers.map((server) => [server.name, server.config])).toEqual([
+			["big", { command: "x", maxOutputBytes: 100_000 }],
+		]);
+		expect(config.errors).toEqual([
+			expect.stringContaining('server "zero": maxOutputBytes must be a positive integer'),
+			expect.stringContaining('server "fraction": maxOutputBytes must be a positive integer'),
+		]);
 	});
 
 	// #10277
@@ -386,6 +407,37 @@ describe("MCP tools", () => {
 		// Text within the limit is not saved.
 		await convertMcpResult("docs", "small", { content: [{ type: "text", text: "ok" }] }, { saveOutput });
 		expect(saved).toHaveLength(1);
+	});
+
+	it("keeps model-facing text up to the server's maxOutputBytes", async () => {
+		const full = Array.from({ length: 3000 }, (_, index) => `line ${index + 1}`).join("\n");
+		const definition = createMcpToolDefinition({
+			server: "docs",
+			tool: { name: "snapshot", inputSchema: { type: "object" } },
+			name: "mcp__docs__snapshot",
+			exposure: "direct",
+			namespace: { name: "mcp__docs" },
+			timeoutMs: 1000,
+			maxOutputBytes: 64 * 1024,
+			getClient: async () => ({ callTool: async () => ({ content: [{ type: "text", text: full }] }) }),
+		});
+		const result = await definition.execute(
+			"call",
+			{},
+			undefined,
+			undefined,
+			{} as Parameters<typeof definition.execute>[4],
+		);
+		expect(result.content).toEqual([{ type: "text", text: full }]);
+		expect(result.details).toEqual({ server: "docs", tool: "snapshot" });
+
+		const limited = await convertMcpResult(
+			"docs",
+			"snapshot",
+			{ content: [{ type: "text", text: full }] },
+			{ saveOutput: async () => "/tmp/full.txt", maxOutputBytes: 1024 },
+		);
+		expect(Buffer.byteLength((limited.content[0] as { text: string }).text)).toBeLessThan(2 * 1024);
 	});
 
 	it("cuts multi-byte text only at character boundaries", () => {

@@ -1,13 +1,14 @@
 /**
  * Adapts MCP tools to pi tool definitions.
  *
- * Results map onto pi's model-facing content (text and images). Text over 20KB keeps its start and
- * end with the middle cut out, like Codex does, and the full text is saved to a temp file the model
- * can read. Binary resources other than images are saved to temp files too, and resource links name
- * the `read_mcp_resource` tool. Codemode scripts receive the whole `CallToolResult` without `_meta`
- * (`content` blocks as sent by the server, `structuredContent`, `isError`), never truncated: it is
- * the tool's `structuredContent`, and every MCP tool declares a `CallToolResult` output schema. MCP
- * errors (`isError`) are error results for the model, but scripts still resolve to the result.
+ * Results map onto pi's model-facing content (text and images). Text over 20KB, or the server's
+ * `maxOutputBytes`, keeps its start and end with the middle cut out, like Codex does, and the full
+ * text is saved to a temp file the model can read. Binary resources other than images are saved to
+ * temp files too, and resource links name the `read_mcp_resource` tool. Codemode scripts receive
+ * the whole `CallToolResult` without `_meta` (`content` blocks as sent by the server,
+ * `structuredContent`, `isError`), never truncated: it is the tool's `structuredContent`, and every
+ * MCP tool declares a `CallToolResult` output schema. MCP errors (`isError`) are error results for
+ * the model, but scripts still resolve to the result.
  */
 
 import { createHash } from "node:crypto";
@@ -47,7 +48,7 @@ export function toToolExposure(exposure: McpExposure): ToolExposure {
 
 /** Provider tool names are limited to 64 characters of `[A-Za-z0-9_-]`. */
 const MAX_TOOL_NAME_LENGTH = 64;
-/** Model-facing text of an MCP result beyond this is cut in the middle. */
+/** Model-facing text of an MCP result beyond this is cut in the middle. Servers can set `maxOutputBytes`. */
 export const MCP_OUTPUT_MAX_BYTES = 20 * 1024;
 /** Visual (wrapped) result lines shown before the output is expanded. */
 const OUTPUT_PREVIEW_LINES = 5;
@@ -118,15 +119,16 @@ export function createMcpResultSchema(structuredContentSchema: Record<string, un
 }
 
 /**
- * Keep model-facing text within {@link MCP_OUTPUT_MAX_BYTES}. Longer text becomes one text block in
- * Codex's truncation format, followed by the path of the file with the full text; images follow it.
+ * Keep model-facing text within `maxBytes`. Longer text becomes one text block in Codex's truncation
+ * format, followed by the path of the file with the full text; images follow it.
  */
 export async function limitMcpContent(
 	content: (TextContent | ImageContent)[],
 	saveOutput: McpOutputSaver = saveToTempFile,
+	maxBytes = MCP_OUTPUT_MAX_BYTES,
 ): Promise<{ content: (TextContent | ImageContent)[]; fullOutputPath?: string }> {
 	const combined = textOf(content);
-	const truncation = truncateMiddle(combined, MCP_OUTPUT_MAX_BYTES);
+	const truncation = truncateMiddle(combined, maxBytes);
 	if (!truncation.truncated) return { content };
 	let fullOutputPath: string | undefined;
 	let where: string;
@@ -149,6 +151,8 @@ export interface ConvertMcpResultOptions {
 	saveOutput?: McpOutputSaver;
 	/** Whether the server's resources can be read with `read_mcp_resource`, which resource links then name. */
 	readableResources?: boolean;
+	/** Bytes of model-facing text kept before the middle is cut. Default: {@link MCP_OUTPUT_MAX_BYTES}. */
+	maxOutputBytes?: number;
 }
 
 /** File extension for a saved binary resource: the one its URI ends in, else `.bin`. */
@@ -219,7 +223,7 @@ export async function convertMcpResult(
 	if (result.isError && textOf(converted) === "") {
 		converted.push({ type: "text", text: `MCP tool ${server}/${tool} returned an error` });
 	}
-	const { content, fullOutputPath } = await limitMcpContent(converted, options.saveOutput);
+	const { content, fullOutputPath } = await limitMcpContent(converted, options.saveOutput, options.maxOutputBytes);
 	const { _meta: _ignored, ...scriptResult } = result;
 	return {
 		content,
@@ -263,6 +267,8 @@ export function createMcpToolDefinition(options: {
 	getClient: () => Promise<McpToolCaller>;
 	/** Whether `read_mcp_resource` can read the server's resources. */
 	readableResources?: () => boolean;
+	/** The server's `maxOutputBytes`. */
+	maxOutputBytes?: number;
 }): ToolDefinition<TSchema, McpToolDetails> {
 	const { server, tool } = options;
 	const title = tool.title ?? tool.annotations?.title;
@@ -289,7 +295,10 @@ export function createMcpToolDefinition(options: {
 					onUpdate?.({ content: [{ type: "text", text }], details: { server, tool: tool.name } });
 				},
 			});
-			return convertMcpResult(server, tool.name, result, { readableResources: options.readableResources?.() });
+			return convertMcpResult(server, tool.name, result, {
+				readableResources: options.readableResources?.(),
+				maxOutputBytes: options.maxOutputBytes,
+			});
 		},
 	};
 }

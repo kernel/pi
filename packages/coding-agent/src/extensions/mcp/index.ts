@@ -422,6 +422,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 					exposure: getMcpToolExposure(entry.config, tool.name),
 					namespace,
 					timeoutMs: connection.timeoutMs,
+					maxOutputBytes: entry.config.maxOutputBytes,
 					getClient: async () => {
 						// A prepared call can outlive this definition's connection while the readiness
 						// hook waits for a disable/re-enable. Resolve the replacement at execution time.

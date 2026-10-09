@@ -66,6 +66,7 @@ HTTP servers use `url`, `headers`, and `oauth` (see [Authenticate with OAuth](#a
 Both server types support:
 
 - `timeout`: per-request timeout in seconds (default 60). Progress notifications reset it.
+- `maxOutputBytes`: how much text of a tool result the model sees (default 20480). Longer text keeps its start and end, and the full text is saved to a file the model can read with the `read` tool. Raise it when the model cannot read files, or when a tool returns long results it needs whole.
 - `enabled: false`: keep the entry without connecting to it.
 - `exposure` and `toolExposure`: control how tools reach the model (see [Control tool exposure](#control-tool-exposure)).
 - `description`: what the server offers, in a sentence. It lists the server in the system prompt (see [Control tool exposure](#control-tool-exposure)), tool search ranks the server's tools by it, and codemode's `describeNamespace()` returns it. Without it, the first line of the server instructions is used once the server connects.

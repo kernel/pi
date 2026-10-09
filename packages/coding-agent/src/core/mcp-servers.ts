@@ -75,6 +75,11 @@ interface McpServerConfigBase {
 	enabled?: boolean;
 	/** Per-request timeout in seconds. Progress notifications from the server reset it. Default: 60. */
 	timeout?: number;
+	/**
+	 * Bytes of model-facing text a tool result may have. Longer text is cut in the middle and saved to
+	 * a file. Default: 20480.
+	 */
+	maxOutputBytes?: number;
 }
 
 export interface McpStdioServerConfig extends McpServerConfigBase {
@@ -249,7 +254,7 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	if (!SERVER_NAME.test(name)) return `invalid server name "${name}" (use letters, digits, "_" and "-")`;
 	if (!isRecord(raw)) return `server "${name}" must be an object`;
 	const value = resolveExposureAliases(raw);
-	const { type, exposure, enabled, timeout, toolExposure, description } = value;
+	const { type, exposure, enabled, timeout, maxOutputBytes, toolExposure, description } = value;
 	const exposures = MCP_EXPOSURES.map((value) => `"${value}"`).join(", ");
 	if (exposure !== undefined && !isExposure(exposure)) {
 		return `server "${name}": exposure must be one of ${exposures}`;
@@ -266,6 +271,9 @@ export function validateMcpServerConfig(name: string, raw: unknown): McpServerCo
 	}
 	if (timeout !== undefined && (typeof timeout !== "number" || !(timeout > 0))) {
 		return `server "${name}": timeout must be a positive number of seconds`;
+	}
+	if (maxOutputBytes !== undefined && !(Number.isInteger(maxOutputBytes) && (maxOutputBytes as number) > 0)) {
+		return `server "${name}": maxOutputBytes must be a positive integer`;
 	}
 	if (type === "sse") return `server "${name}": legacy SSE transport is not supported; use the streamable HTTP URL`;
 
