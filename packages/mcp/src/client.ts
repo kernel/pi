@@ -1,3 +1,4 @@
+import type { McpClaimResolver, McpClientExtension } from "./extension.ts";
 import type { CallToolResult } from "./protocol/content.ts";
 import {
 	isJsonRpcId,
@@ -33,9 +34,17 @@ import {
 	type SupportedProtocolVersion,
 	type Tool,
 } from "./protocol/types.ts";
+import {
+	createEnvelope,
+	resolveResult,
+	STATELESS_PROTOCOL_VERSION,
+	toInitializeResult,
+	withExtensions,
+} from "./stateless.ts";
 import type { McpTransport } from "./transports/transport.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const NO_CLAIMS: ReadonlyMap<string, McpClaimResolver> = new Map();
 const MAX_LIST_PAGES = 1_000;
 
 type ClientState = "idle" | "connecting" | "connected" | "closed";
@@ -46,7 +55,13 @@ type RequestHandler = (params: unknown, context: { signal: AbortSignal }) => unk
 
 export interface McpClientOptions extends Implementation {
 	capabilities?: ClientCapabilities;
-	protocolVersion?: SupportedProtocolVersion;
+	/**
+	 * {@link STATELESS_PROTOCOL_VERSION} connects with `server/discover` and the per-request `_meta`
+	 * envelope (see stateless.ts); other versions use the `initialize` handshake.
+	 */
+	protocolVersion?: SupportedProtocolVersion | typeof STATELESS_PROTOCOL_VERSION;
+	/** Extensions to declare and use on stateless connections. Ignored with `initialize`. */
+	extensions?: readonly McpClientExtension[];
 	requestTimeoutMs?: number;
 	roots?: readonly Root[] | (() => readonly Root[] | Promise<readonly Root[]>);
 }
@@ -159,6 +174,10 @@ export class McpClient {
 	private serverCapabilitiesValue: ServerCapabilities | undefined;
 	private instructionsValue: string | undefined;
 	private protocolVersionValue: string | undefined;
+	/** `_meta` every request carries, on stateless connections. */
+	private envelope: Record<string, unknown> | undefined;
+	/** Resolvers of the `tools/call` result types extensions claim, on stateless connections. */
+	private claims = new Map<string, McpClaimResolver>();
 	private pending = new Map<JsonRpcId, PendingRequest>();
 	private progressRequests = new Map<JsonRpcId, JsonRpcId>();
 	private incoming = new Map<JsonRpcId, AbortController>();
@@ -214,37 +233,62 @@ export class McpClient {
 			await transport.start();
 			const capabilities: ClientCapabilities = { ...this.options.capabilities };
 			if (this.options.roots && capabilities.roots === undefined) capabilities.roots = {};
-			const result = validateInitializeResult(
-				await this.requestInternal(
-					"initialize",
-					{
-						protocolVersion: this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION,
-						capabilities,
-						clientInfo: {
-							name: this.options.name,
-							version: this.options.version,
-							...(this.options.title === undefined ? {} : { title: this.options.title }),
-						},
-					},
-					{},
-					true,
-				),
-			);
-			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
-				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
-			}
+			const clientInfo: Implementation = {
+				name: this.options.name,
+				version: this.options.version,
+				...(this.options.title === undefined ? {} : { title: this.options.title }),
+			};
+			const stateless = this.options.protocolVersion === STATELESS_PROTOCOL_VERSION;
+			const result = stateless
+				? await this.discover(transport, clientInfo, capabilities)
+				: await this.initialize(transport, clientInfo, capabilities);
 			this.protocolVersionValue = result.protocolVersion;
 			this.serverInfoValue = result.serverInfo;
 			this.serverCapabilitiesValue = result.capabilities;
 			this.instructionsValue = result.instructions;
-			transport.setProtocolVersion?.(result.protocolVersion);
-			await this.notifyInternal("notifications/initialized", undefined, true);
 			this.state = "connected";
 			return result;
 		} catch (error) {
 			await this.close().catch(() => {});
 			throw error;
 		}
+	}
+
+	private async initialize(
+		transport: McpTransport,
+		clientInfo: Implementation,
+		capabilities: ClientCapabilities,
+	): Promise<InitializeResult> {
+		const result = validateInitializeResult(
+			await this.requestInternal(
+				"initialize",
+				{ protocolVersion: this.options.protocolVersion ?? LATEST_PROTOCOL_VERSION, capabilities, clientInfo },
+				{},
+				true,
+			),
+		);
+		if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
+			throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
+		}
+		transport.setProtocolVersion?.(result.protocolVersion);
+		await this.notifyInternal("notifications/initialized", undefined, true);
+		return result;
+	}
+
+	/** `server/discover` replaces `initialize`; from here on every request carries the envelope. */
+	private async discover(
+		transport: McpTransport,
+		clientInfo: Implementation,
+		capabilities: ClientCapabilities,
+	): Promise<InitializeResult> {
+		const extensions = this.options.extensions ?? [];
+		this.envelope = createEnvelope(clientInfo, withExtensions(capabilities, extensions));
+		for (const extension of extensions) {
+			for (const [resultType, resolve] of Object.entries(extension.claims ?? {}))
+				this.claims.set(resultType, resolve);
+		}
+		transport.setProtocolVersion?.(STATELESS_PROTOCOL_VERSION);
+		return toInitializeResult(await this.requestInternal("server/discover", undefined, {}, true));
 	}
 
 	request<Result = unknown>(
@@ -333,7 +377,8 @@ export class McpClient {
 	}
 
 	async readResource(uri: string, options: McpRequestOptions = {}): Promise<ReadResourceResult> {
-		return validateReadResourceResult(await this.request("resources/read", { uri }, options));
+		const result = await this.request("resources/read", { uri }, options);
+		return validateReadResourceResult(await this.resolve("resources/read", result, options));
 	}
 
 	private async listPage(
@@ -378,9 +423,21 @@ export class McpClient {
 		args?: Record<string, unknown>,
 		options: McpRequestOptions = {},
 	): Promise<CallToolResult> {
-		return validateCallToolResult(
-			await this.request("tools/call", { name, ...(args === undefined ? {} : { arguments: args }) }, options),
+		const result = await this.request(
+			"tools/call",
+			{ name, ...(args === undefined ? {} : { arguments: args }) },
+			options,
 		);
+		return validateCallToolResult(await this.resolve("tools/call", result, options));
+	}
+
+	/** Results of stateless connections are typed; see `resolveResult` in stateless.ts. */
+	private resolve(method: string, result: unknown, options: McpRequestOptions): Promise<unknown> | unknown {
+		if (!this.envelope) return result;
+		return resolveResult(method, result, method === "tools/call" ? this.claims : NO_CLAIMS, {
+			...options,
+			client: this,
+		});
 	}
 
 	async close(): Promise<void> {
@@ -401,10 +458,12 @@ export class McpClient {
 		if (options.signal?.aborted) throw new McpAbortError();
 		const id = this.nextRequestId++;
 		const progressToken = options.onProgress ? id : undefined;
-		const requestParams =
-			progressToken === undefined
-				? params
-				: { ...params, _meta: { ...(isObject(params?._meta) ? params._meta : {}), progressToken } };
+		const meta = {
+			...(isObject(params?._meta) ? params._meta : {}),
+			...this.envelope,
+			...(progressToken === undefined ? {} : { progressToken }),
+		};
+		const requestParams = Object.keys(meta).length === 0 ? params : { ...params, _meta: meta };
 		const message: JsonRpcRequest = {
 			jsonrpc: "2.0",
 			id,

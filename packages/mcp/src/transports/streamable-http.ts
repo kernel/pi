@@ -9,6 +9,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { routingHeaders, STATELESS_PROTOCOL_VERSION } from "../stateless.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
 
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
@@ -225,7 +226,11 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	async send(message: JsonRpcMessage): Promise<void> {
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
 		const response = await this.authorizedFetch("POST", {
-			headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+			headers: {
+				accept: "application/json, text/event-stream",
+				"content-type": "application/json",
+				...(this.protocolVersion === STATELESS_PROTOCOL_VERSION ? routingHeaders(message) : {}),
+			},
 			body: JSON.stringify(message),
 		});
 		await this.checkResponse(response);

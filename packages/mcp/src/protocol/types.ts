@@ -25,10 +25,13 @@ export interface ClientCapabilities {
 	roots?: { listChanged?: boolean };
 	sampling?: Record<string, unknown>;
 	elicitation?: Record<string, unknown>;
+	/** Protocol extensions by identifier, with their settings. Stateless revision only. */
+	extensions?: Record<string, Record<string, unknown>>;
 }
 
 export interface ServerCapabilities {
 	experimental?: Record<string, unknown>;
+	extensions?: Record<string, Record<string, unknown>>;
 	logging?: Record<string, unknown>;
 	prompts?: { listChanged?: boolean };
 	resources?: { subscribe?: boolean; listChanged?: boolean };

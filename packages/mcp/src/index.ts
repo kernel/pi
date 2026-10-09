@@ -1,5 +1,7 @@
 export type { AuthProvider, McpFetch, UnauthorizedContext } from "./auth-provider.ts";
 export { McpClient, type McpClientOptions, type McpRequestOptions } from "./client.ts";
+export type { McpClaimContext, McpClaimResolver, McpClientExtension } from "./extension.ts";
+export { createTasksExtension, TASKS_EXTENSION, type Task, type TaskStatus } from "./extensions/tasks.ts";
 export {
 	type AudioContent,
 	type BlobResourceContents,
@@ -55,6 +57,7 @@ export {
 	type ToolAnnotations,
 	type ToolExecution,
 } from "./protocol/types.ts";
+export { type DiscoverResult, STATELESS_PROTOCOL_VERSION } from "./stateless.ts";
 export { StdioTransport, type StdioTransportOptions } from "./transports/stdio.ts";
 export {
 	McpAuthRequiredError,

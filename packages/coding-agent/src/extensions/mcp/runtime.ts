@@ -11,6 +11,7 @@ import { pathToFileURL } from "node:url";
 import {
 	type AuthProvider,
 	type CallToolResult,
+	createTasksExtension,
 	JSON_RPC_ERROR_CODES,
 	type ListResourcesResult,
 	type ListResourceTemplatesResult,
@@ -25,6 +26,7 @@ import {
 	type ReadResourceResult,
 	type Resource,
 	type ResourceTemplate,
+	STATELESS_PROTOCOL_VERSION,
 	StdioTransport,
 	StreamableHttpTransport,
 } from "@earendil-works/pi-mcp";
@@ -376,11 +378,14 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async connectOnce(): Promise<McpClient> {
+		const stateless = this.entry.config.protocolVersion === STATELESS_PROTOCOL_VERSION;
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
+			// The Tasks extension polls the tasks a server answers with, so tool calls stay synchronous.
+			...(stateless ? { protocolVersion: STATELESS_PROTOCOL_VERSION, extensions: [createTasksExtension()] } : {}),
 		});
 		const log = this.log;
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));

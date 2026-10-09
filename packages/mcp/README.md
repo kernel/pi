@@ -129,7 +129,33 @@ An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages 
 - OAuth protected-resource and authorization-server discovery
 - PKCE authorization code flow, dynamic client registration, token refresh (one refresh shared by concurrent 401s), and step-up authorization for `insufficient_scope`
 
-Batch JSON-RPC messages, legacy HTTP+SSE, servers, sampling, and tasks are outside the initial core.
+Batch JSON-RPC messages, legacy HTTP+SSE, servers, sampling, and the 2025-11-25 experimental tasks are outside the initial core.
+
+## Stateless protocol revision (2026-07-28)
+
+`protocolVersion: STATELESS_PROTOCOL_VERSION` opts a connection into the 2026-07-28 revision. There is no fallback to `initialize`. Everything specific to it lives in `src/stateless.ts`:
+
+- `server/discover` instead of `initialize` and `notifications/initialized`
+- the `_meta` envelope (protocol version, client info, client capabilities) on every request
+- `Mcp-Method` and `Mcp-Name` headers on Streamable HTTP requests
+- `resultType` on results: `input_required` rejects, since the client cannot answer input requests yet; other types go to the extension that claims them
+
+Not supported yet: answering `input_required` (multi-round-trip requests), `subscriptions/listen` (so list-changed notifications do not arrive), and result caching hints.
+
+### Extensions
+
+`extensions` takes `McpClientExtension`s. On stateless connections the client declares each one under `capabilities.extensions` and hands it the `tools/call` results whose `resultType` it claims. On `initialize` connections extensions are ignored.
+
+`createTasksExtension()` implements the Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) in `src/extensions/tasks.ts`. It claims `resultType: "task"` and polls `tasks/get` until the task ends, so `callTool()` still resolves to the final `CallToolResult`. A failed task rejects with its JSON-RPC error. Aborting the call, or a task that needs input, cancels the task with `tasks/cancel`.
+
+```ts
+const client = new McpClient({
+	name: "my-app",
+	version: "1.0.0",
+	protocolVersion: STATELESS_PROTOCOL_VERSION,
+	extensions: [createTasksExtension()],
+});
+```
 
 ## Testing
 
