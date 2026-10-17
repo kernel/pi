@@ -523,7 +523,7 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 | Memory | `MemoryStorage` from the package root | Nothing is persisted. |
 | SQLite | `openNodeSqliteStorage(file)` from `@earendil-works/pi-durable/storage/sqlite/node` | One database file. WAL mode with `synchronous = NORMAL`: commits survive process crashes; the newest may be lost on power or host failure. |
 | JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. |
-| Postgres | `PostgresStorage.open(pool, { session })` from `@earendil-works/pi-durable/storage/postgres` | One Session per `session` name; many Sessions share one schema. Locked to one process. |
+| Postgres | `PostgresStorage.open(pool, { session })` from `@earendil-works/pi-durable/storage/postgres` | One Session per `session` name; many Sessions share one schema. Locked to one process. Each commit is one transaction of a few set-based statements. Pass `migrate: false` when the schema is migrated in an explicit step, so an open costs two statements. |
 
 One process owns a storage at a time; SQLite and JSONL do no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
 

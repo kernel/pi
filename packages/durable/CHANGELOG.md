@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Postgres storage commits a batch in one transaction of a few set-based statements instead of one statement per record: ids are checked and claimed as sets, each table's rows are inserted in one multi-row statement, documents are read once, and revisions are cleared and added together, all in a single data-modifying CTE statement that also advances the session. Admitting one input drops from 22 queries to 6; creating a conversation from 37 to 13.
+- Postgres storage caches the conversation records it has read; the storage is a Session's only writer and conversation records are only inserted, so a record stays valid until this storage writes it.
+- `PostgresStorage.open` takes `migrate: false` to skip the schema check for deployments that migrate in an explicit step.
+
+
 ### Breaking Changes
 
 - The portable SQLite facade in `@earendil-works/pi-durable/storage/sqlite` is asynchronous: `SqliteDatabase` extends the new `SqliteExecutor` (`exec`, `run`, `get`, `all` by SQL text), `prepare` and `SqliteStatement` are removed, `transaction` takes an async callback that receives a transaction handle, and `close()` returns a promise. Custom adapters must be rewritten ([#10232](https://github.com/earendil-works/pi/pull/10232) by [@christianklotz](https://github.com/christianklotz)).

@@ -53,6 +53,13 @@ type RevisionRow = {
 };
 type IdRow = { readonly id: string };
 type MetadataRow = { readonly next_id: string; readonly next_seq: string };
+type DocumentWrites = {
+	readonly claims: DocumentId[];
+	readonly inserts: PostgresValue[][];
+	readonly retirements: PostgresValue[][];
+	readonly clearRevisions: DocumentId[];
+	readonly revisions: PostgresValue[][];
+};
 type DocumentAction = {
 	create?: DocumentCreate;
 	copy?: Extract<StorageWrite, { readonly type: "document.copy" }>["source"];
@@ -79,6 +86,12 @@ export interface PostgresStorageOptions {
 	readonly session: string;
 	/** Schema holding the tables, created on first open. Defaults to `pi_durable`. */
 	readonly schema?: string;
+	/**
+	 * Apply schema migrations on open. Defaults to true. A deployment that migrates in an explicit step before
+	 * starting, or opens many Sessions per process, passes false so an open costs two statements and takes no
+	 * schema-wide lock.
+	 */
+	readonly migrate?: boolean;
 }
 
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
@@ -134,6 +147,9 @@ const isAliveAt = (record: DocumentRecord, at: DocumentPoint): boolean => {
 const isCurrentOnly = (record: DocumentRecord): boolean =>
 	record.scope.kind !== "conversation" || record.history === "latest";
 
+/** A Postgres array literal of record ids, for `= ANY($n::bigint[])` with the adapter's scalar parameter type. */
+const arrayLiteral = (ids: readonly number[]): string => `{${[...new Set(ids)].join(",")}}`;
+
 const writeId = (write: StorageWrite): Id<string> | undefined => {
 	switch (write.type) {
 		case "conversation":
@@ -171,6 +187,11 @@ export class PostgresStorage implements Storage {
 	private closed = false;
 	private lost: Error | undefined;
 	private closing: Promise<void> | undefined;
+	/**
+	 * Conversation records read so far. This storage is the session's only writer and conversation records are
+	 * only ever inserted, so a record stays valid until a commit of this storage writes that conversation.
+	 */
+	private readonly conversations = new Map<ConversationId, ConversationRecord>();
 	private admitted = 0;
 	private drained: (() => void) | undefined;
 
@@ -206,7 +227,7 @@ export class PostgresStorage implements Storage {
 	static async open(pool: PostgresPool, options: PostgresStorageOptions): Promise<PostgresStorage> {
 		if (options.session.length === 0) throw new TypeError("PostgresStorage requires a non-empty session");
 		const schema = options.schema ?? DEFAULT_POSTGRES_SCHEMA;
-		await applyPostgresMigrations(pool, schema);
+		if (options.migrate !== false) await applyPostgresMigrations(pool, schema);
 
 		const lockClient = await pool.connect();
 		let storage: PostgresStorage | undefined;
@@ -282,17 +303,23 @@ export class PostgresStorage implements Storage {
 				}
 				const committedSeq = seqFromNumber(Number(metadata.next_seq));
 				await this.checkGlobalIds(client, writes);
-				await this.checkDocumentActions(client, documentActions);
-				for (const write of writes) await this.applyTableWrite(client, write, committedSeq);
-				await this.applyDocumentActions(client, documentActions, committedSeq);
-				await client.query(`UPDATE ${this.tables.sessions} SET next_id = $2, next_seq = $3 WHERE session_id = $1`, [
-					this.session,
-					Math.max(Number(metadata.next_id), candidateNextId),
-					committedSeq + 1,
-				]);
+				const existingDocuments = await this.checkDocumentActions(client, documentActions);
+				const documentWrites = await this.prepareDocumentWrites(
+					client,
+					documentActions,
+					existingDocuments,
+					committedSeq,
+				);
+				await this.writeBatch(client, writes, documentWrites, committedSeq, {
+					nextId: Math.max(Number(metadata.next_id), candidateNextId),
+					nextSeq: committedSeq + 1,
+				});
 				return committedSeq;
 			});
 			this.nextId = Math.max(this.nextId, candidateNextId);
+			for (const write of writes) {
+				if (write.type === "conversation") this.conversations.set(write.value.id, write.value);
+			}
 			return seq;
 		});
 	}
@@ -643,8 +670,12 @@ export class PostgresStorage implements Storage {
 		return record === undefined ? undefined : parseJson<T>(record);
 	}
 
-	private readConversation(id: ConversationId): Promise<ConversationRecord | undefined> {
-		return this.recordById<ConversationRecord>(this.tables.conversations, id);
+	private async readConversation(id: ConversationId): Promise<ConversationRecord | undefined> {
+		const cached = this.conversations.get(id);
+		if (cached !== undefined) return cached;
+		const record = await this.recordById<ConversationRecord>(this.tables.conversations, id);
+		if (record !== undefined) this.conversations.set(id, record);
+		return record;
 	}
 
 	private async materializeDocument(
@@ -695,18 +726,22 @@ export class PostgresStorage implements Storage {
 	}
 
 	private async checkGlobalIds(executor: PostgresQueryable, writes: readonly StorageWrite[]): Promise<void> {
-		const claimed = new Map<Id<string>, TableName>();
+		const planned: Array<{ readonly id: Id<string>; readonly table: TableName }> = [];
 		for (const write of writes) {
 			if (write.type === "document.change" || write.type === "document.retire") continue;
 			const document = write.type === "document.create" || write.type === "document.copy";
-			const table: TableName = document ? "document" : write.type;
-			const id = document ? write.record.id : write.value.id;
-			const existing = (
-				await executor.query<RecordIdRow>(
-					`SELECT record_type FROM ${this.tables.recordIds} WHERE session_id = $1 AND id = $2`,
-					[this.session, id],
-				)
-			).rows[0]?.record_type;
+			planned.push({ id: document ? write.record.id : write.value.id, table: document ? "document" : write.type });
+		}
+		if (planned.length === 0) return;
+		const existingByID = new Map<Id<string>, TableName>();
+		const rows = await executor.query<IdRow & RecordIdRow>(
+			`SELECT id, record_type FROM ${this.tables.recordIds} WHERE session_id = $1 AND id = ANY($2::bigint[])`,
+			[this.session, arrayLiteral(planned.map((entry) => entry.id))],
+		);
+		for (const row of rows.rows) existingByID.set(idFromNumber<Id<string>>(Number(row.id)), row.record_type);
+		const claimed = new Map<Id<string>, TableName>();
+		for (const { id, table } of planned) {
+			const existing = existingByID.get(id);
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
 				if (existing !== undefined) throw new Error(`ID ${id} already belongs to ${existing}`);
@@ -767,16 +802,26 @@ export class PostgresStorage implements Storage {
 		return actions;
 	}
 
+	/** Validates the batch's document actions and returns the records of the documents it touches that already exist. */
 	private async checkDocumentActions(
 		executor: PostgresQueryable,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
-	): Promise<void> {
+	): Promise<Map<DocumentId, DocumentRecord>> {
+		const existingByID = new Map<DocumentId, DocumentRecord>();
+		if (actions.size === 0) return existingByID;
+		const rows = await executor.query<{ readonly id: string; readonly record: string }>(
+			`SELECT id, record::text AS record FROM ${this.tables.documents} WHERE session_id = $1 AND id = ANY($2::bigint[])`,
+			[this.session, arrayLiteral([...actions.keys()])],
+		);
+		for (const row of rows.rows) {
+			existingByID.set(idFromNumber<DocumentId>(Number(row.id)), parseJson<DocumentRecord>(row.record));
+		}
 		const liveCounts = new Map<string, number>();
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id)) {
 				throw new StorageRejected(`Document copy ${id} source is changed in the copy batch`);
 			}
-			const existing = await this.recordById<DocumentRecord>(this.tables.documents, id, executor);
+			const existing = existingByID.get(id);
 			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
 			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
@@ -793,6 +838,9 @@ export class PostgresStorage implements Storage {
 					throw new Error(`Document ${id} version transition requires a base`);
 				}
 			}
+			// Only a create or retire can change how many incarnations an address has; a content change on an
+			// existing document needs no lookup.
+			if (action.create === undefined && !action.retire) continue;
 			const record = action.create ?? existing!;
 			const key = addressKey(record);
 			let live = liveCounts.get(key);
@@ -804,6 +852,7 @@ export class PostgresStorage implements Storage {
 		for (const live of liveCounts.values()) {
 			if (live > 1) throw new Error("Document address already has a current incarnation");
 		}
+		return existingByID;
 	}
 
 	private async currentDocumentId(
@@ -823,96 +872,18 @@ export class PostgresStorage implements Storage {
 		return id === undefined ? undefined : idFromNumber<DocumentId>(Number(id));
 	}
 
-	private async applyTableWrite(executor: PostgresQueryable, write: StorageWrite, seq: Seq): Promise<void> {
-		switch (write.type) {
-			case "conversation":
-				await this.claimId(executor, write.value.id, "conversation");
-				await executor.query(
-					`INSERT INTO ${this.tables.conversations}
-						(session_id, id, owner_conversation_id, owner_task_id, record) VALUES ($1, $2, $3, $4, $5)`,
-					[
-						this.session,
-						write.value.id,
-						write.value.owner?.conversationId ?? null,
-						write.value.owner?.taskId ?? null,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "entry":
-				await this.claimId(executor, write.value.id, "entry");
-				await executor.query(
-					`INSERT INTO ${this.tables.entries} (session_id, id, conversation_id, head, commit_seq, record)
-						VALUES ($1, $2, $3, $4, $5, $6)`,
-					[
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						write.value.head ?? null,
-						seq,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "task":
-				await this.claimId(executor, write.value.id, "task");
-				await executor.query(
-					`INSERT INTO ${this.tables.tasks}
-						(session_id, id, conversation_id, kind, status, abort_requested, background, record)
-						VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-						ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
-						background = excluded.background, record = excluded.record`,
-					[
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						encodeIndexedString(write.value.kind),
-						write.value.state.status,
-						write.value.abortRequested,
-						write.value.background,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "submission":
-				await this.claimId(executor, write.value.id, "submission");
-				await executor.query(
-					`INSERT INTO ${this.tables.submissions} (session_id, id, conversation_id, request_id, status, record)
-						VALUES ($1, $2, $3, $4, $5, $6)
-						ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
-					[
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
-						write.value.status,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "document.create":
-			case "document.copy":
-			case "document.change":
-			case "document.retire":
-				break;
-		}
-	}
-
-	private async claimId(executor: PostgresQueryable, id: Id<string>, table: TableName): Promise<void> {
-		await executor.query(
-			`INSERT INTO ${this.tables.recordIds} (session_id, id, record_type) VALUES ($1, $2, $3)
-				ON CONFLICT (session_id, id) DO NOTHING`,
-			[this.session, id, table],
-		);
-	}
-
-	private async applyDocumentActions(
+	/**
+	 * Resolves the batch's document actions into rows: records to insert, retirements to apply to existing
+	 * documents, revision histories to clear, and revisions to add. Copy sources are read here; the rows are
+	 * written with everything else in `writeBatch`.
+	 */
+	private async prepareDocumentWrites(
 		executor: PostgresQueryable,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
+		existing: ReadonlyMap<DocumentId, DocumentRecord>,
 		seq: Seq,
-	): Promise<void> {
+	): Promise<DocumentWrites> {
+		const writes: DocumentWrites = { claims: [], inserts: [], retirements: [], clearRevisions: [], revisions: [] };
 		for (const [id, action] of actions) {
 			let content = action.content;
 			if (action.copy !== undefined) {
@@ -938,62 +909,167 @@ export class PostgresStorage implements Storage {
 			}
 			let record: DocumentRecord;
 			if (action.create !== undefined) {
-				record = {
-					...action.create,
-					createdAt: seq,
-					...(action.retire ? { retiredAt: seq } : {}),
-				};
+				record = { ...action.create, createdAt: seq, ...(action.retire ? { retiredAt: seq } : {}) };
 				const parts = addressParts(record);
-				await this.claimId(executor, id, "document");
-				await executor.query(
-					`INSERT INTO ${this.tables.documents}
-						(session_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-						VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-					[
-						this.session,
-						id,
-						parts.kind,
-						parts.family,
-						parts.keyValue,
-						parts.scopeKind,
-						parts.ownerId,
-						seq,
-						action.retire ? seq : null,
-						encodeJson(record),
-					],
-				);
+				writes.claims.push(id);
+				writes.inserts.push([
+					this.session,
+					id,
+					parts.kind,
+					parts.family,
+					parts.keyValue,
+					parts.scopeKind,
+					parts.ownerId,
+					seq,
+					action.retire ? seq : null,
+					encodeJson(record),
+				]);
 			} else {
-				record = (await this.recordById<DocumentRecord>(this.tables.documents, id, executor))!;
-			}
-
-			if (content !== undefined) {
-				if (content.kind === "base" && isCurrentOnly(record)) await this.deleteRevisions(executor, id);
-				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
-				await executor.query(
-					`INSERT INTO ${this.tables.revisions} (session_id, document_id, seq, kind, version, content)
-						VALUES ($1, $2, $3, $4, $5, $6)`,
-					[this.session, id, seq, content.kind, content.version, encodedContent],
-				);
-			}
-
-			if (action.retire) {
-				if (action.create === undefined) {
+				record = existing.get(id)!;
+				if (action.retire) {
 					record = { ...record, retiredAt: seq };
-					await executor.query(
-						`UPDATE ${this.tables.documents} SET retired_at = $3, record = $4 WHERE session_id = $1 AND id = $2`,
-						[this.session, id, seq, encodeJson(record)],
-					);
+					writes.retirements.push([this.session, id, seq, encodeJson(record)]);
 				}
-				if (isCurrentOnly(record)) await this.deleteRevisions(executor, id);
+			}
+			// A retired current-only document keeps no revisions, so one written in the same batch would only be
+			// deleted again and is skipped. A base otherwise replaces a current-only document's history.
+			const retiredCurrentOnly = action.retire && isCurrentOnly(record);
+			if (retiredCurrentOnly || (content?.kind === "base" && isCurrentOnly(record))) writes.clearRevisions.push(id);
+			if (content !== undefined && !retiredCurrentOnly) {
+				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
+				writes.revisions.push([this.session, id, seq, content.kind, content.version, encodedContent]);
 			}
 		}
+		return writes;
 	}
 
-	private async deleteRevisions(executor: PostgresQueryable, id: DocumentId): Promise<void> {
-		await executor.query(`DELETE FROM ${this.tables.revisions} WHERE session_id = $1 AND document_id = $2`, [
-			this.session,
-			id,
-		]);
+	/**
+	 * Writes the whole batch in one statement: data-modifying CTEs claim every new id, insert each table's rows,
+	 * clear and add revisions, and the statement's final UPDATE advances the session. A task or submission written
+	 * twice in one batch keeps its last write, as serial upserts did. Retiring an existing document is the one
+	 * action written separately, since it updates rows that may also be read by the batch's other actions.
+	 */
+	private async writeBatch(
+		executor: PostgresQueryable,
+		writes: readonly StorageWrite[],
+		documents: DocumentWrites,
+		seq: Seq,
+		session: { readonly nextId: number; readonly nextSeq: number },
+	): Promise<void> {
+		const claims = new Map<Id<string>, TableName>();
+		const conversations: PostgresValue[][] = [];
+		const entries: PostgresValue[][] = [];
+		const tasks = new Map<Id<string>, PostgresValue[]>();
+		const submissions = new Map<Id<string>, PostgresValue[]>();
+		for (const write of writes) {
+			switch (write.type) {
+				case "conversation":
+					claims.set(write.value.id, "conversation");
+					conversations.push([
+						this.session,
+						write.value.id,
+						write.value.owner?.conversationId ?? null,
+						write.value.owner?.taskId ?? null,
+						encodeJson(write.value),
+					]);
+					break;
+				case "entry":
+					claims.set(write.value.id, "entry");
+					entries.push([
+						this.session,
+						write.value.id,
+						write.value.conversationId,
+						write.value.head ?? null,
+						seq,
+						encodeJson(write.value),
+					]);
+					break;
+				case "task":
+					claims.set(write.value.id, "task");
+					tasks.set(write.value.id, [
+						this.session,
+						write.value.id,
+						write.value.conversationId,
+						encodeIndexedString(write.value.kind),
+						write.value.state.status,
+						write.value.abortRequested,
+						write.value.background,
+						encodeJson(write.value),
+					]);
+					break;
+				case "submission":
+					claims.set(write.value.id, "submission");
+					submissions.set(write.value.id, [
+						this.session,
+						write.value.id,
+						write.value.conversationId,
+						write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
+						write.value.status,
+						encodeJson(write.value),
+					]);
+					break;
+				case "document.create":
+				case "document.copy":
+				case "document.change":
+				case "document.retire":
+					break;
+			}
+		}
+		for (const id of documents.claims) claims.set(id, "document");
+
+		for (const [sessionID, id, retiredAt, record] of documents.retirements) {
+			await executor.query(
+				`UPDATE ${this.tables.documents} SET retired_at = $3, record = $4 WHERE session_id = $1 AND id = $2`,
+				[sessionID, id, retiredAt, record],
+			);
+		}
+
+		const params: PostgresValue[] = [this.session];
+		const values = (rows: readonly (readonly PostgresValue[])[]): string =>
+			rows.map((row) => `(${row.map((value) => `$${params.push(value)}`).join(", ")})`).join(", ");
+		const parts: string[] = [];
+		if (claims.size > 0) {
+			parts.push(`claims AS (INSERT INTO ${this.tables.recordIds} (session_id, id, record_type)
+				VALUES ${values([...claims].map(([id, table]) => [this.session, id, table]))}
+				ON CONFLICT (session_id, id) DO NOTHING)`);
+		}
+		if (conversations.length > 0) {
+			parts.push(`conversations AS (INSERT INTO ${this.tables.conversations}
+				(session_id, id, owner_conversation_id, owner_task_id, record) VALUES ${values(conversations)})`);
+		}
+		if (entries.length > 0) {
+			parts.push(`entries AS (INSERT INTO ${this.tables.entries}
+				(session_id, id, conversation_id, head, commit_seq, record) VALUES ${values(entries)})`);
+		}
+		if (tasks.size > 0) {
+			parts.push(`tasks AS (INSERT INTO ${this.tables.tasks}
+				(session_id, id, conversation_id, kind, status, abort_requested, background, record)
+				VALUES ${values([...tasks.values()])}
+				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
+				kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
+				background = excluded.background, record = excluded.record)`);
+		}
+		if (submissions.size > 0) {
+			parts.push(`submissions AS (INSERT INTO ${this.tables.submissions}
+				(session_id, id, conversation_id, request_id, status, record) VALUES ${values([...submissions.values()])}
+				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
+				request_id = excluded.request_id, status = excluded.status, record = excluded.record)`);
+		}
+		if (documents.inserts.length > 0) {
+			parts.push(`documents AS (INSERT INTO ${this.tables.documents}
+				(session_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
+				VALUES ${values(documents.inserts)})`);
+		}
+		if (documents.clearRevisions.length > 0) {
+			parts.push(`cleared AS (DELETE FROM ${this.tables.revisions}
+				WHERE session_id = $1 AND document_id = ANY($${params.push(arrayLiteral(documents.clearRevisions))}::bigint[]))`);
+		}
+		if (documents.revisions.length > 0) {
+			parts.push(`revisions AS (INSERT INTO ${this.tables.revisions}
+				(session_id, document_id, seq, kind, version, content) VALUES ${values(documents.revisions)})`);
+		}
+		const update = `UPDATE ${this.tables.sessions} SET next_id = $${params.push(session.nextId)}, next_seq = $${params.push(session.nextSeq)} WHERE session_id = $1`;
+		await executor.query(parts.length === 0 ? update : `WITH ${parts.join(",\n")} ${update}`, params);
 	}
 
 	private assertOpen(): void {
