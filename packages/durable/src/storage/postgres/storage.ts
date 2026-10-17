@@ -42,7 +42,6 @@ import { applyPostgresMigrations, DEFAULT_POSTGRES_SCHEMA, quoteIdentifier } fro
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type TableName = "conversation" | "entry" | "task" | "submission" | "document";
-type RecordIdRow = { readonly record_type: TableName };
 type JsonRow = { readonly record: string };
 type EntryJsonRow = { readonly record: string; readonly commit_seq: string };
 type RevisionRow = {
@@ -53,6 +52,13 @@ type RevisionRow = {
 };
 type IdRow = { readonly id: string };
 type MetadataRow = { readonly next_id: string; readonly next_seq: string };
+type CommitState = {
+	readonly session:
+		| { readonly next_id: number | string; readonly next_seq: number | string; readonly owner: string }
+		| undefined;
+	readonly ids: ReadonlyMap<Id<string>, TableName>;
+	readonly documents: ReadonlyMap<DocumentId, DocumentRecord>;
+};
 type DocumentWrites = {
 	readonly claims: DocumentId[];
 	readonly inserts: PostgresValue[][];
@@ -146,6 +152,15 @@ const isAliveAt = (record: DocumentRecord, at: DocumentPoint): boolean => {
 
 const isCurrentOnly = (record: DocumentRecord): boolean =>
 	record.scope.kind !== "conversation" || record.history === "latest";
+
+// Column types of each table's insert list, for casting VALUES parameters.
+const RECORD_ID_TYPES = ["text", "bigint", "text"];
+const CONVERSATION_TYPES = ["text", "bigint", "bigint", "bigint", "json"];
+const ENTRY_TYPES = ["text", "bigint", "bigint", "bigint", "bigint", "json"];
+const TASK_TYPES = ["text", "bigint", "bigint", "text", "text", "boolean", "boolean", "json"];
+const SUBMISSION_TYPES = ["text", "bigint", "bigint", "text", "text", "json"];
+const DOCUMENT_TYPES = ["text", "bigint", "text", "smallint", "text", "text", "bigint", "bigint", "bigint", "json"];
+const REVISION_TYPES = ["text", "bigint", "bigint", "text", "integer", "json"];
 
 /** A Postgres array literal of record ids, for `= ANY($n::bigint[])` with the adapter's scalar parameter type. */
 const arrayLiteral = (ids: readonly number[]): string => `{${[...new Set(ids)].join(",")}}`;
@@ -288,40 +303,80 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const documentActions = this.prepareDocumentActions(writes);
 			const candidateNextId = this.candidateNextId(writes);
-			const seq = await inTransaction(this.pool, "BEGIN", async (client) => {
-				const metadata = (
-					await client.query<MetadataRow & { readonly owner: string }>(
-						`SELECT next_id, next_seq, owner FROM ${this.tables.sessions} WHERE session_id = $1 FOR UPDATE`,
-						[this.session],
-					)
-				).rows[0];
-				if (metadata === undefined) throw new Error("Durable Postgres session metadata is missing");
-				if (metadata.owner !== this.owner) {
-					const error = new Error(`Durable Postgres session ${this.session} was opened by another process`);
-					this.loseLock(error);
-					throw error;
-				}
-				const committedSeq = seqFromNumber(Number(metadata.next_seq));
-				await this.checkGlobalIds(client, writes);
-				const existingDocuments = await this.checkDocumentActions(client, documentActions);
-				const documentWrites = await this.prepareDocumentWrites(
-					client,
-					documentActions,
-					existingDocuments,
-					committedSeq,
-				);
-				await this.writeBatch(client, writes, documentWrites, committedSeq, {
-					nextId: Math.max(Number(metadata.next_id), candidateNextId),
-					nextSeq: committedSeq + 1,
-				});
-				return committedSeq;
+			// Two round trips: one read of everything the checks need, then one statement that writes the whole
+			// batch. A single statement is atomic by itself, so no transaction brackets it; the write is gated on
+			// this storage still owning the session at the sequence the read observed, which is what the row lock
+			// used to guarantee.
+			const state = await this.readCommitState(writes, documentActions);
+			if (state.session === undefined) throw new Error("Durable Postgres session metadata is missing");
+			if (state.session.owner !== this.owner) {
+				const error = new Error(`Durable Postgres session ${this.session} was opened by another process`);
+				this.loseLock(error);
+				throw error;
+			}
+			const committedSeq = seqFromNumber(Number(state.session.next_seq));
+			this.checkGlobalIds(writes, state.ids);
+			await this.checkDocumentActions(this.pool, documentActions, state.documents);
+			const documentWrites = await this.prepareDocumentWrites(
+				this.pool,
+				documentActions,
+				state.documents,
+				committedSeq,
+			);
+			const written = await this.writeBatch(this.pool, writes, documentWrites, committedSeq, {
+				nextId: Math.max(Number(state.session.next_id), candidateNextId),
+				nextSeq: committedSeq + 1,
+				expectedSeq: committedSeq,
 			});
+			if (!written) {
+				const error = new Error(`Durable Postgres session ${this.session} was opened by another process`);
+				this.loseLock(error);
+				throw error;
+			}
 			this.nextId = Math.max(this.nextId, candidateNextId);
 			for (const write of writes) {
 				if (write.type === "conversation") this.conversations.set(write.value.id, write.value);
 			}
-			return seq;
+			return committedSeq;
 		});
+	}
+
+	/** Everything a commit checks before writing, read in one statement: the session row, the batch's claimed ids, and its documents. */
+	private async readCommitState(
+		writes: readonly StorageWrite[],
+		actions: ReadonlyMap<DocumentId, DocumentAction>,
+	): Promise<CommitState> {
+		const ids = new Set<number>();
+		for (const write of writes) {
+			const id = writeId(write);
+			if (id !== undefined) ids.add(id);
+		}
+		const row = (
+			await this.pool.query<{ readonly state: string }>(
+				`SELECT json_build_object(
+					'session', (SELECT row_to_json(s) FROM ${this.tables.sessions} s WHERE s.session_id = $1),
+					'ids', (SELECT coalesce(json_agg(json_build_object('id', r.id, 'type', r.record_type)), '[]'::json)
+						FROM ${this.tables.recordIds} r WHERE r.session_id = $1 AND r.id = ANY($2::bigint[])),
+					'documents', (SELECT coalesce(json_agg(json_build_object('id', d.id, 'record', d.record)), '[]'::json)
+						FROM ${this.tables.documents} d WHERE d.session_id = $1 AND d.id = ANY($3::bigint[]))
+				)::text AS state`,
+				[this.session, arrayLiteral([...ids]), arrayLiteral([...actions.keys()])],
+			)
+		).rows[0];
+		const raw = parseJson<{
+			readonly session: {
+				readonly next_id: number | string;
+				readonly next_seq: number | string;
+				readonly owner: string;
+			} | null;
+			readonly ids: readonly { readonly id: number | string; readonly type: TableName }[];
+			readonly documents: readonly { readonly id: number | string; readonly record: DocumentRecord }[];
+		}>(row.state);
+		const existingIds = new Map<Id<string>, TableName>();
+		for (const entry of raw.ids) existingIds.set(idFromNumber<Id<string>>(Number(entry.id)), entry.type);
+		const documents = new Map<DocumentId, DocumentRecord>();
+		for (const entry of raw.documents) documents.set(idFromNumber<DocumentId>(Number(entry.id)), entry.record);
+		return { session: raw.session ?? undefined, ids: existingIds, documents };
 	}
 
 	async mintId<I extends Id<string>>(): Promise<I> {
@@ -725,22 +780,13 @@ export class PostgresStorage implements Storage {
 		return nextId;
 	}
 
-	private async checkGlobalIds(executor: PostgresQueryable, writes: readonly StorageWrite[]): Promise<void> {
-		const planned: Array<{ readonly id: Id<string>; readonly table: TableName }> = [];
+	private checkGlobalIds(writes: readonly StorageWrite[], existingByID: ReadonlyMap<Id<string>, TableName>): void {
+		const claimed = new Map<Id<string>, TableName>();
 		for (const write of writes) {
 			if (write.type === "document.change" || write.type === "document.retire") continue;
 			const document = write.type === "document.create" || write.type === "document.copy";
-			planned.push({ id: document ? write.record.id : write.value.id, table: document ? "document" : write.type });
-		}
-		if (planned.length === 0) return;
-		const existingByID = new Map<Id<string>, TableName>();
-		const rows = await executor.query<IdRow & RecordIdRow>(
-			`SELECT id, record_type FROM ${this.tables.recordIds} WHERE session_id = $1 AND id = ANY($2::bigint[])`,
-			[this.session, arrayLiteral(planned.map((entry) => entry.id))],
-		);
-		for (const row of rows.rows) existingByID.set(idFromNumber<Id<string>>(Number(row.id)), row.record_type);
-		const claimed = new Map<Id<string>, TableName>();
-		for (const { id, table } of planned) {
+			const table: TableName = document ? "document" : write.type;
+			const id = document ? write.record.id : write.value.id;
 			const existing = existingByID.get(id);
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
@@ -802,20 +848,12 @@ export class PostgresStorage implements Storage {
 		return actions;
 	}
 
-	/** Validates the batch's document actions and returns the records of the documents it touches that already exist. */
+	/** Validates the batch's document actions against the records read for them. */
 	private async checkDocumentActions(
 		executor: PostgresQueryable,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
-	): Promise<Map<DocumentId, DocumentRecord>> {
-		const existingByID = new Map<DocumentId, DocumentRecord>();
-		if (actions.size === 0) return existingByID;
-		const rows = await executor.query<{ readonly id: string; readonly record: string }>(
-			`SELECT id, record::text AS record FROM ${this.tables.documents} WHERE session_id = $1 AND id = ANY($2::bigint[])`,
-			[this.session, arrayLiteral([...actions.keys()])],
-		);
-		for (const row of rows.rows) {
-			existingByID.set(idFromNumber<DocumentId>(Number(row.id)), parseJson<DocumentRecord>(row.record));
-		}
+		existingByID: ReadonlyMap<DocumentId, DocumentRecord>,
+	): Promise<void> {
 		const liveCounts = new Map<string, number>();
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id)) {
@@ -852,7 +890,6 @@ export class PostgresStorage implements Storage {
 		for (const live of liveCounts.values()) {
 			if (live > 1) throw new Error("Document address already has a current incarnation");
 		}
-		return existingByID;
 	}
 
 	private async currentDocumentId(
@@ -954,8 +991,8 @@ export class PostgresStorage implements Storage {
 		writes: readonly StorageWrite[],
 		documents: DocumentWrites,
 		seq: Seq,
-		session: { readonly nextId: number; readonly nextSeq: number },
-	): Promise<void> {
+		session: { readonly nextId: number; readonly nextSeq: number; readonly expectedSeq: number },
+	): Promise<boolean> {
 		const claims = new Map<Id<string>, TableName>();
 		const conversations: PostgresValue[][] = [];
 		const entries: PostgresValue[][] = [];
@@ -1017,59 +1054,74 @@ export class PostgresStorage implements Storage {
 		}
 		for (const id of documents.claims) claims.set(id, "document");
 
-		for (const [sessionID, id, retiredAt, record] of documents.retirements) {
-			await executor.query(
-				`UPDATE ${this.tables.documents} SET retired_at = $3, record = $4 WHERE session_id = $1 AND id = $2`,
-				[sessionID, id, retiredAt, record],
-			);
+		// Every write is gated on the guard: the session row still carries this owner at the sequence the
+		// pre-read observed. When another process has taken the session over, every CTE writes nothing and the
+		// final UPDATE affects no row.
+		const params: PostgresValue[] = [this.session, this.owner, session.expectedSeq];
+		const guard = `WHERE EXISTS (SELECT 1 FROM guard)`;
+		// Parameters in a VALUES subselect carry no type inference, so each column is cast to its table type.
+		const values = (rows: readonly (readonly PostgresValue[])[], casts: readonly string[]): string => {
+			const names = casts.map((_, index) => `c${index}`).join(", ");
+			const list = rows
+				.map((row) => `(${row.map((value, index) => `$${params.push(value)}::${casts[index]}`).join(", ")})`)
+				.join(", ");
+			return `SELECT ${names} FROM (VALUES ${list}) AS v(${names}) ${guard}`;
+		};
+		const parts: string[] = [
+			`guard AS (SELECT 1 FROM ${this.tables.sessions} WHERE session_id = $1 AND owner = $2 AND next_seq = $3)`,
+		];
+		for (const [, id, retiredAt, record] of documents.retirements) {
+			parts.push(`retire_${id} AS (UPDATE ${this.tables.documents} SET retired_at = $${params.push(retiredAt)}::bigint,
+				record = $${params.push(record)}::json WHERE session_id = $1 AND id = $${params.push(id)}::bigint AND EXISTS (SELECT 1 FROM guard))`);
 		}
-
-		const params: PostgresValue[] = [this.session];
-		const values = (rows: readonly (readonly PostgresValue[])[]): string =>
-			rows.map((row) => `(${row.map((value) => `$${params.push(value)}`).join(", ")})`).join(", ");
-		const parts: string[] = [];
 		if (claims.size > 0) {
 			parts.push(`claims AS (INSERT INTO ${this.tables.recordIds} (session_id, id, record_type)
-				VALUES ${values([...claims].map(([id, table]) => [this.session, id, table]))}
+				${values(
+					[...claims].map(([id, table]) => [this.session, id, table]),
+					RECORD_ID_TYPES,
+				)}
 				ON CONFLICT (session_id, id) DO NOTHING)`);
 		}
 		if (conversations.length > 0) {
 			parts.push(`conversations AS (INSERT INTO ${this.tables.conversations}
-				(session_id, id, owner_conversation_id, owner_task_id, record) VALUES ${values(conversations)})`);
+				(session_id, id, owner_conversation_id, owner_task_id, record) ${values(conversations, CONVERSATION_TYPES)})`);
 		}
 		if (entries.length > 0) {
 			parts.push(`entries AS (INSERT INTO ${this.tables.entries}
-				(session_id, id, conversation_id, head, commit_seq, record) VALUES ${values(entries)})`);
+				(session_id, id, conversation_id, head, commit_seq, record) ${values(entries, ENTRY_TYPES)})`);
 		}
 		if (tasks.size > 0) {
 			parts.push(`tasks AS (INSERT INTO ${this.tables.tasks}
 				(session_id, id, conversation_id, kind, status, abort_requested, background, record)
-				VALUES ${values([...tasks.values()])}
+				${values([...tasks.values()], TASK_TYPES)}
 				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
 				kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
 				background = excluded.background, record = excluded.record)`);
 		}
 		if (submissions.size > 0) {
 			parts.push(`submissions AS (INSERT INTO ${this.tables.submissions}
-				(session_id, id, conversation_id, request_id, status, record) VALUES ${values([...submissions.values()])}
+				(session_id, id, conversation_id, request_id, status, record) ${values([...submissions.values()], SUBMISSION_TYPES)}
 				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
 				request_id = excluded.request_id, status = excluded.status, record = excluded.record)`);
 		}
 		if (documents.inserts.length > 0) {
 			parts.push(`documents AS (INSERT INTO ${this.tables.documents}
 				(session_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-				VALUES ${values(documents.inserts)})`);
+				${values(documents.inserts, DOCUMENT_TYPES)})`);
 		}
 		if (documents.clearRevisions.length > 0) {
 			parts.push(`cleared AS (DELETE FROM ${this.tables.revisions}
-				WHERE session_id = $1 AND document_id = ANY($${params.push(arrayLiteral(documents.clearRevisions))}::bigint[]))`);
+				WHERE session_id = $1 AND document_id = ANY($${params.push(arrayLiteral(documents.clearRevisions))}::bigint[])
+				AND EXISTS (SELECT 1 FROM guard))`);
 		}
 		if (documents.revisions.length > 0) {
 			parts.push(`revisions AS (INSERT INTO ${this.tables.revisions}
-				(session_id, document_id, seq, kind, version, content) VALUES ${values(documents.revisions)})`);
+				(session_id, document_id, seq, kind, version, content) ${values(documents.revisions, REVISION_TYPES)})`);
 		}
-		const update = `UPDATE ${this.tables.sessions} SET next_id = $${params.push(session.nextId)}, next_seq = $${params.push(session.nextSeq)} WHERE session_id = $1`;
-		await executor.query(parts.length === 0 ? update : `WITH ${parts.join(",\n")} ${update}`, params);
+		const update = `UPDATE ${this.tables.sessions} SET next_id = $${params.push(session.nextId)}, next_seq = $${params.push(session.nextSeq)}
+			WHERE session_id = $1 AND owner = $2 AND next_seq = $3`;
+		const result = await executor.query(`WITH ${parts.join(",\n")} ${update}`, params);
+		return (result.rowCount ?? 0) > 0;
 	}
 
 	private assertOpen(): void {
