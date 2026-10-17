@@ -52,12 +52,16 @@ type RevisionRow = {
 };
 type IdRow = { readonly id: string };
 type MetadataRow = { readonly next_id: string; readonly next_seq: string };
+/** A conversation's own entries over one contiguous id range ending at its newest entry, newest-last. */
+type EntryWindow = { ids: EntryId[]; complete: boolean };
+type DocumentState = { readonly record: string; readonly version: number; value: JsonObject; deltasSinceBase: number };
 type CommitState = {
 	readonly session:
 		| { readonly next_id: number | string; readonly next_seq: number | string; readonly owner: string }
 		| undefined;
 	readonly ids: ReadonlyMap<Id<string>, TableName>;
 	readonly documents: ReadonlyMap<DocumentId, DocumentRecord>;
+	readonly versions: ReadonlyMap<DocumentId, number>;
 };
 type DocumentWrites = {
 	readonly claims: DocumentId[];
@@ -65,6 +69,11 @@ type DocumentWrites = {
 	readonly retirements: PostgresValue[][];
 	readonly clearRevisions: DocumentId[];
 	readonly revisions: PostgresValue[][];
+	/** The record as written and the content applied, per document, for the caches. */
+	readonly applied: Map<
+		DocumentId,
+		{ readonly record: DocumentRecord; readonly content: DocumentContent | undefined }
+	>;
 };
 type DocumentAction = {
 	create?: DocumentCreate;
@@ -162,6 +171,24 @@ const SUBMISSION_TYPES = ["text", "bigint", "bigint", "text", "text", "json"];
 const DOCUMENT_TYPES = ["text", "bigint", "text", "smallint", "text", "text", "bigint", "bigint", "bigint", "json"];
 const REVISION_TYPES = ["text", "bigint", "bigint", "text", "integer", "json"];
 
+/** Entries loaded per conversation on first use, and the most kept as commits extend the window. */
+const ENTRY_WINDOW_LOAD = 256;
+const ENTRY_WINDOW_MAX = 1024;
+
+const requestKey = (conversationId: ConversationId, requestId: string): string => `${conversationId}:${requestId}`;
+
+/** Index of the first element greater than `value` in an ascending array. */
+const upperBound = (values: readonly number[], value: number): number => {
+	let low = 0;
+	let high = values.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (values[middle] <= value) low = middle + 1;
+		else high = middle;
+	}
+	return low;
+};
+
 /** A Postgres array literal of record ids, for `= ANY($n::bigint[])` with the adapter's scalar parameter type. */
 const arrayLiteral = (ids: readonly number[]): string => `{${[...new Set(ids)].join(",")}}`;
 
@@ -207,6 +234,18 @@ export class PostgresStorage implements Storage {
 	 * only ever inserted, so a record stays valid until a commit of this storage writes that conversation.
 	 */
 	private readonly conversations = new Map<ConversationId, ConversationRecord>();
+	// Read-through caches with the same justification: this storage is the Session's only writer, so a record it
+	// has read stays valid until it writes that record, and every write passes through `commit` below. Values are
+	// kept JSON-encoded so a caller gets a detached object each time, as from the database.
+	private readonly tasks = new Map<TaskId, string>();
+	private readonly submissions = new Map<SubmissionId, string>();
+	private readonly submissionsByRequest = new Map<string, SubmissionId>();
+	private readonly entries = new Map<EntryId, { readonly record: string; readonly commitSeq: Seq }>();
+	private readonly entryWindows = new Map<ConversationId, EntryWindow>();
+	private readonly headMarkers = new Map<ConversationId, EntryId[]>();
+	private readonly documentStates = new Map<DocumentId, DocumentState>();
+	private documentScans = new Map<string, string[]>();
+	private documentAddresses = new Map<string, string>();
 	private admitted = 0;
 	private drained: (() => void) | undefined;
 
@@ -316,7 +355,7 @@ export class PostgresStorage implements Storage {
 			}
 			const committedSeq = seqFromNumber(Number(state.session.next_seq));
 			this.checkGlobalIds(writes, state.ids);
-			await this.checkDocumentActions(this.pool, documentActions, state.documents);
+			await this.checkDocumentActions(this.pool, documentActions, state.documents, state.versions);
 			const documentWrites = await this.prepareDocumentWrites(
 				this.pool,
 				documentActions,
@@ -334,9 +373,7 @@ export class PostgresStorage implements Storage {
 				throw error;
 			}
 			this.nextId = Math.max(this.nextId, candidateNextId);
-			for (const write of writes) {
-				if (write.type === "conversation") this.conversations.set(write.value.id, write.value);
-			}
+			this.absorb(writes, documentActions, documentWrites, committedSeq);
 			return committedSeq;
 		});
 	}
@@ -351,6 +388,7 @@ export class PostgresStorage implements Storage {
 			const id = writeId(write);
 			if (id !== undefined) ids.add(id);
 		}
+		const deltas = [...actions].filter(([, action]) => action.content?.kind === "delta").map(([id]) => id);
 		const row = (
 			await this.pool.query<{ readonly state: string }>(
 				`SELECT json_build_object(
@@ -358,9 +396,12 @@ export class PostgresStorage implements Storage {
 					'ids', (SELECT coalesce(json_agg(json_build_object('id', r.id, 'type', r.record_type)), '[]'::json)
 						FROM ${this.tables.recordIds} r WHERE r.session_id = $1 AND r.id = ANY($2::bigint[])),
 					'documents', (SELECT coalesce(json_agg(json_build_object('id', d.id, 'record', d.record)), '[]'::json)
-						FROM ${this.tables.documents} d WHERE d.session_id = $1 AND d.id = ANY($3::bigint[]))
+						FROM ${this.tables.documents} d WHERE d.session_id = $1 AND d.id = ANY($3::bigint[])),
+					'versions', (SELECT coalesce(json_agg(json_build_object('id', v.document_id, 'version', v.version)), '[]'::json)
+						FROM (SELECT DISTINCT ON (document_id) document_id, version FROM ${this.tables.revisions}
+							WHERE session_id = $1 AND document_id = ANY($4::bigint[]) ORDER BY document_id, seq DESC) v)
 				)::text AS state`,
-				[this.session, arrayLiteral([...ids]), arrayLiteral([...actions.keys()])],
+				[this.session, arrayLiteral([...ids]), arrayLiteral([...actions.keys()]), arrayLiteral(deltas)],
 			)
 		).rows[0];
 		const raw = parseJson<{
@@ -371,12 +412,15 @@ export class PostgresStorage implements Storage {
 			} | null;
 			readonly ids: readonly { readonly id: number | string; readonly type: TableName }[];
 			readonly documents: readonly { readonly id: number | string; readonly record: DocumentRecord }[];
+			readonly versions: readonly { readonly id: number | string; readonly version: number }[];
 		}>(row.state);
 		const existingIds = new Map<Id<string>, TableName>();
 		for (const entry of raw.ids) existingIds.set(idFromNumber<Id<string>>(Number(entry.id)), entry.type);
 		const documents = new Map<DocumentId, DocumentRecord>();
 		for (const entry of raw.documents) documents.set(idFromNumber<DocumentId>(Number(entry.id)), entry.record);
-		return { session: raw.session ?? undefined, ids: existingIds, documents };
+		const versions = new Map<DocumentId, number>();
+		for (const entry of raw.versions) versions.set(idFromNumber<DocumentId>(Number(entry.id)), entry.version);
+		return { session: raw.session ?? undefined, ids: existingIds, documents, versions };
 	}
 
 	async mintId<I extends Id<string>>(): Promise<I> {
@@ -460,14 +504,19 @@ export class PostgresStorage implements Storage {
 			conversation = await this.readConversation(conversationId);
 			if (conversation === undefined) throw new Error(`Unknown conversation: ${conversationId}`);
 		}
-		const row = (
-			await this.pool.query<EntryJsonRow>(
-				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries} WHERE session_id = $1 AND id = $2`,
-				[this.session, id],
-			)
-		).rows[0];
-		if (row === undefined) return undefined;
-		const entry = parseJson<EntryRecord>(row.record);
+		let stored = this.entries.get(id);
+		if (stored === undefined) {
+			const row = (
+				await this.pool.query<EntryJsonRow>(
+					`SELECT record::text AS record, commit_seq FROM ${this.tables.entries} WHERE session_id = $1 AND id = $2`,
+					[this.session, id],
+				)
+			).rows[0];
+			if (row === undefined) return undefined;
+			stored = { record: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) };
+			this.entries.set(id, stored);
+		}
+		const entry = parseJson<EntryRecord>(stored.record);
 		if (conversation !== undefined) {
 			let upperEntryId = Number.POSITIVE_INFINITY;
 			while (conversation.id !== entry.conversationId) {
@@ -477,7 +526,7 @@ export class PostgresStorage implements Storage {
 			}
 			if (entry.id > upperEntryId) return undefined;
 		}
-		return { entry, commitSeq: seqFromNumber(Number(row.commit_seq)) };
+		return { entry, commitSeq: stored.commitSeq };
 	}
 
 	private async readLatestHeadMarker(
@@ -486,21 +535,37 @@ export class PostgresStorage implements Storage {
 	): Promise<(EntryRecord & { readonly head: EntryId }) | undefined> {
 		let conversation = await this.readConversation(conversationId);
 		if (conversation === undefined) throw new Error(`Unknown conversation: ${conversationId}`);
-		let upper: number | undefined = atOrBeforeEntryId;
+		let upper = atOrBeforeEntryId ?? Number.POSITIVE_INFINITY;
 		while (true) {
-			const params: PostgresValue[] = [this.session, conversation.id];
-			const bound = upper === undefined ? "" : ` AND id <= $${params.push(upper)}`;
-			const [record] = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.entries}
-					WHERE session_id = $1 AND conversation_id = $2 AND head IS NOT NULL${bound}
-					ORDER BY id DESC LIMIT 1`,
-				params,
-			);
-			if (record !== undefined) return parseJson<EntryRecord & { readonly head: EntryId }>(record);
+			const ids = await this.headMarkerIds(conversation.id);
+			const index = upperBound(ids, upper) - 1;
+			if (index >= 0)
+				return parseJson<EntryRecord & { readonly head: EntryId }>(this.entries.get(ids[index])!.record);
 			if (conversation.parent === undefined) return undefined;
-			upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
+			upper = Math.min(upper, conversation.parent.at);
 			conversation = (await this.readConversation(conversation.parent.conversationId))!;
 		}
+	}
+
+	/** Every head marker of one conversation, ascending; loaded once, extended by commits. */
+	private async headMarkerIds(conversationId: ConversationId): Promise<EntryId[]> {
+		let ids = this.headMarkers.get(conversationId);
+		if (ids !== undefined) return ids;
+		const rows = (
+			await this.pool.query<EntryJsonRow>(
+				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries}
+					WHERE session_id = $1 AND conversation_id = $2 AND head IS NOT NULL ORDER BY id`,
+				[this.session, conversationId],
+			)
+		).rows;
+		ids = [];
+		for (const row of rows) {
+			const entry = parseJson<EntryRecord>(row.record);
+			this.entries.set(entry.id, { record: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) });
+			ids.push(entry.id);
+		}
+		this.headMarkers.set(conversationId, ids);
+		return ids;
 	}
 
 	private async readEntries(
@@ -515,16 +580,8 @@ export class PostgresStorage implements Storage {
 		if (after !== undefined) upper = Math.min(upper ?? Number.MAX_SAFE_INTEGER, after - 1);
 		const values: EntryRecord[] = [];
 		while (true) {
-			const params: PostgresValue[] = [this.session, conversation.id];
-			const clauses = ["session_id = $1", "conversation_id = $2"];
-			if (query.minEntryId !== undefined) clauses.push(`id >= $${params.push(query.minEntryId)}`);
-			if (upper !== undefined) clauses.push(`id <= $${params.push(upper)}`);
-			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
-					ORDER BY id DESC LIMIT $${params.push(limit + 1 - values.length)}`,
-				params,
-			);
-			values.push(...rows.map(parseJson<EntryRecord>));
+			const rows = await this.entriesBelow(conversation.id, query.minEntryId, upper, limit + 1 - values.length);
+			values.push(...rows);
 			if (values.length > limit || conversation.parent === undefined) break;
 			upper = upper === undefined ? conversation.parent.at : Math.min(upper, conversation.parent.at);
 			if (query.minEntryId !== undefined && upper < query.minEntryId) break;
@@ -533,8 +590,164 @@ export class PostgresStorage implements Storage {
 		return page(values, limit);
 	}
 
+	/**
+	 * Up to `limit` of one conversation's own entries with ids in `[min, upper]`, newest first. Served from the
+	 * conversation's window when it covers the range; otherwise the part below the window is read, and extends
+	 * the window when it is contiguous with it.
+	 */
+	private async entriesBelow(
+		conversationId: ConversationId,
+		min: number | undefined,
+		upper: number | undefined,
+		limit: number,
+	): Promise<EntryRecord[]> {
+		const window = await this.entryWindow(conversationId);
+		const out: EntryRecord[] = [];
+		let index = upper === undefined ? window.ids.length - 1 : upperBound(window.ids, upper) - 1;
+		for (; index >= 0 && out.length < limit; index--) {
+			const id = window.ids[index];
+			if (min !== undefined && id < min) return out;
+			out.push(parseJson<EntryRecord>(this.entries.get(id)!.record));
+		}
+		if (out.length >= limit || window.complete) return out;
+		const oldest = window.ids[0];
+		const belowWindow = upper === undefined || oldest === undefined || upper >= oldest;
+		const dbUpper = belowWindow && oldest !== undefined ? oldest - 1 : upper;
+		const params: PostgresValue[] = [this.session, conversationId];
+		const clauses = ["session_id = $1", "conversation_id = $2"];
+		if (min !== undefined) clauses.push(`id >= $${params.push(min)}`);
+		if (dbUpper !== undefined) clauses.push(`id <= $${params.push(dbUpper)}`);
+		const wanted = limit - out.length;
+		const rows = (
+			await this.pool.query<EntryJsonRow>(
+				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
+					ORDER BY id DESC LIMIT $${params.push(wanted)}`,
+				params,
+			)
+		).rows;
+		const fetched = rows.map((row) => ({ entry: parseJson<EntryRecord>(row.record), row }));
+		if (belowWindow) {
+			// Contiguous with the window: keep these so a later scan of the same range needs no read. Fewer rows
+			// than asked for, with no lower bound cutting them off, means the conversation starts here.
+			for (const { entry, row } of fetched) {
+				this.entries.set(entry.id, { record: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) });
+			}
+			window.ids.unshift(...fetched.map(({ entry }) => entry.id).reverse());
+			if (fetched.length < wanted && min === undefined) window.complete = true;
+		}
+		out.push(...fetched.map(({ entry }) => entry));
+		return out;
+	}
+
+	/** The conversation's entry window, loaded from its newest entries on first use. */
+	private async entryWindow(conversationId: ConversationId): Promise<EntryWindow> {
+		let window = this.entryWindows.get(conversationId);
+		if (window !== undefined) return window;
+		const rows = (
+			await this.pool.query<EntryJsonRow>(
+				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries}
+					WHERE session_id = $1 AND conversation_id = $2 ORDER BY id DESC LIMIT $3`,
+				[this.session, conversationId, ENTRY_WINDOW_LOAD + 1],
+			)
+		).rows;
+		const ids: EntryId[] = [];
+		for (const row of rows.slice(0, ENTRY_WINDOW_LOAD).reverse()) {
+			const entry = parseJson<EntryRecord>(row.record);
+			this.entries.set(entry.id, { record: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) });
+			ids.push(entry.id);
+		}
+		window = { ids, complete: rows.length <= ENTRY_WINDOW_LOAD };
+		this.entryWindows.set(conversationId, window);
+		return window;
+	}
+
+	/** Reflects a committed batch in the caches. Called only after the write statement reported success. */
+	private absorb(
+		writes: readonly StorageWrite[],
+		actions: ReadonlyMap<DocumentId, DocumentAction>,
+		documents: DocumentWrites,
+		seq: Seq,
+	): void {
+		for (const write of writes) {
+			switch (write.type) {
+				case "conversation":
+					this.conversations.set(write.value.id, parseJson<ConversationRecord>(encodeJson(write.value)));
+					break;
+				case "task":
+					this.tasks.set(write.value.id, encodeJson(write.value));
+					break;
+				case "submission":
+					this.rememberSubmission(encodeJson(write.value));
+					break;
+				case "entry": {
+					const record = encodeJson(write.value);
+					this.entries.set(write.value.id, { record, commitSeq: seq });
+					const window = this.entryWindows.get(write.value.conversationId);
+					if (window !== undefined) {
+						window.ids.push(write.value.id);
+						if (window.ids.length > ENTRY_WINDOW_MAX) {
+							const heads = new Set(this.headMarkers.get(write.value.conversationId) ?? []);
+							for (const id of window.ids.splice(0, window.ids.length - ENTRY_WINDOW_MAX)) {
+								if (!heads.has(id)) this.entries.delete(id);
+							}
+							window.complete = false;
+						}
+					}
+					if (write.value.head !== undefined)
+						this.headMarkers.get(write.value.conversationId)?.push(write.value.id);
+					break;
+				}
+				default:
+					break;
+			}
+		}
+		if (actions.size === 0) return;
+		for (const [id, { record, content }] of documents.applied) {
+			if (record.retiredAt !== undefined) {
+				this.documentStates.delete(id);
+				continue;
+			}
+			const state = this.documentStates.get(id);
+			if (content?.kind === "base") {
+				this.documentStates.set(id, {
+					record: encodeJson(record),
+					version: content.version,
+					value: parseJson<JsonObject>(encodeJson(content.value)),
+					deltasSinceBase: 0,
+				});
+			} else if (content?.kind === "delta" && state !== undefined && state.version === content.version) {
+				state.value = apply(state.value, parseJson<readonly Op[]>(encodeJson(content.ops))) as JsonObject;
+				state.deltasSinceBase++;
+			} else if (content !== undefined) {
+				this.documentStates.delete(id);
+			}
+		}
+		// Creating or retiring a document changes what an address or scope scan resolves to.
+		if (documents.inserts.length > 0 || documents.retirements.length > 0) {
+			this.documentScans = new Map();
+			this.documentAddresses = new Map();
+		}
+	}
+
+	private rememberSubmission(record: string): void {
+		const submission = parseJson<SubmissionRecord>(record);
+		this.submissions.set(submission.id, record);
+		if (submission.requestId !== undefined) {
+			this.submissionsByRequest.set(requestKey(submission.conversationId, submission.requestId), submission.id);
+		}
+	}
+
 	task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
-		return this.admit(() => this.recordById<StoredTask>(this.tables.tasks, id));
+		return this.admit(async () => {
+			const cached = this.tasks.get(id);
+			if (cached !== undefined) return parseJson<StoredTask>(cached);
+			const [record] = await this.records(
+				`SELECT record::text AS record FROM ${this.tables.tasks} WHERE session_id = $1 AND id = $2`,
+				[this.session, id],
+			);
+			if (record !== undefined) this.tasks.set(id, record);
+			return record === undefined ? undefined : parseJson<StoredTask>(record);
+		});
 	}
 
 	scanTasks(
@@ -564,7 +777,16 @@ export class PostgresStorage implements Storage {
 	}
 
 	submission(id: SubmissionId, _context: Context): Promise<SubmissionRecord | undefined> {
-		return this.admit(() => this.recordById<SubmissionRecord>(this.tables.submissions, id));
+		return this.admit(async () => {
+			const cached = this.submissions.get(id);
+			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
+			const [record] = await this.records(
+				`SELECT record::text AS record FROM ${this.tables.submissions} WHERE session_id = $1 AND id = $2`,
+				[this.session, id],
+			);
+			if (record !== undefined) this.rememberSubmission(record);
+			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
+		});
 	}
 
 	scanSubmissions(
@@ -594,17 +816,26 @@ export class PostgresStorage implements Storage {
 		_context: Context,
 	): Promise<SubmissionRecord | undefined> {
 		return this.admit(async () => {
+			const cachedId = this.submissionsByRequest.get(requestKey(conversationId, requestId));
+			const cached = cachedId === undefined ? undefined : this.submissions.get(cachedId);
+			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
 			const [record] = await this.records(
 				`SELECT record::text AS record FROM ${this.tables.submissions}
 					WHERE session_id = $1 AND conversation_id = $2 AND request_id = $3`,
 				[this.session, conversationId, encodeIndexedString(requestId)],
 			);
+			if (record !== undefined) this.rememberSubmission(record);
 			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
 		});
 	}
 
 	findDocument(address: DocumentAddress, at: DocumentPoint, _context: Context): Promise<DocumentRecord | undefined> {
 		return this.admit(async () => {
+			const key = at === "current" ? addressKey(address) : undefined;
+			if (key !== undefined) {
+				const cached = this.documentAddresses.get(key);
+				if (cached !== undefined) return parseJson<DocumentRecord>(cached);
+			}
 			const parts = addressParts(address);
 			const params: PostgresValue[] = [
 				this.session,
@@ -625,17 +856,38 @@ export class PostgresStorage implements Storage {
 					ORDER BY created_at DESC LIMIT 1`,
 				params,
 			);
+			if (key !== undefined && record !== undefined) this.documentAddresses.set(key, record);
 			return record === undefined ? undefined : parseJson<DocumentRecord>(record);
 		});
 	}
 
 	document(id: DocumentId, at: DocumentPoint, _context: Context): Promise<StoredDocument | undefined> {
-		// The record and revision queries must observe one committed state; a commit between them can replace the base.
-		return this.admit(() =>
-			inTransaction(this.pool, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", (client) =>
+		return this.admit(async () => {
+			if (at === "current") {
+				const state = this.documentStates.get(id);
+				if (state !== undefined) {
+					return {
+						record: parseJson<DocumentRecord>(state.record),
+						version: state.version,
+						value: parseJson<JsonObject>(encodeJson(state.value)),
+						deltasSinceBase: state.deltasSinceBase,
+					};
+				}
+			}
+			// The record and revision queries must observe one committed state; a commit between them can replace the base.
+			const stored = await inTransaction(this.pool, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", (client) =>
 				this.materializeDocument(client, id, at),
-			),
-		);
+			);
+			if (at === "current" && stored !== undefined) {
+				this.documentStates.set(id, {
+					record: encodeJson(stored.record),
+					version: stored.version,
+					value: parseJson<JsonObject>(encodeJson(stored.value)),
+					deltasSinceBase: stored.deltasSinceBase,
+				});
+			}
+			return stored;
+		});
 	}
 
 	scanDocuments(
@@ -646,7 +898,16 @@ export class PostgresStorage implements Storage {
 	): Promise<Page<DocumentRecord, Cursor>> {
 		return this.admit(async () => {
 			const scope = scopeColumns(query.scope);
-			const params: PostgresValue[] = [this.session, scope.scopeKind, scope.ownerId, cursorId(cursor) ?? -1];
+			const after = cursorId(cursor) ?? -1;
+			const key = query.at === "current" ? `${scope.scopeKind}:${scope.ownerId}:${query.kind ?? ""}` : undefined;
+			if (key !== undefined) {
+				const cached = this.documentScans.get(key);
+				if (cached !== undefined) {
+					const records = cached.map(parseJson<DocumentRecord>).filter((record) => record.id > after);
+					return page(records.slice(0, limit + 1), limit);
+				}
+			}
+			const params: PostgresValue[] = [this.session, scope.scopeKind, scope.ownerId, after];
 			const clauses = ["session_id = $1", "scope_kind = $2", "owner_id = $3", "id > $4"];
 			if (query.kind !== undefined) clauses.push(`kind = $${params.push(encodeIndexedString(query.kind))}`);
 			if (query.at === "current") {
@@ -657,12 +918,16 @@ export class PostgresStorage implements Storage {
 					`(retired_at IS NULL OR retired_at > $${params.length})`,
 				);
 			}
+			// A current scan is cached whole: it is read from its start without a page limit, and a scope's live
+			// documents are few.
+			const whole = key !== undefined && after === -1;
 			const rows = await this.records(
 				`SELECT record::text AS record FROM ${this.tables.documents} WHERE ${clauses.join(" AND ")}
-					ORDER BY id LIMIT $${params.push(limit + 1)}`,
+					ORDER BY id${whole ? "" : ` LIMIT $${params.push(limit + 1)}`}`,
 				params,
 			);
-			return page(rows.map(parseJson<DocumentRecord>), limit);
+			if (whole) this.documentScans.set(key!, rows);
+			return page(rows.slice(0, limit + 1).map(parseJson<DocumentRecord>), limit);
 		});
 	}
 
@@ -853,6 +1118,7 @@ export class PostgresStorage implements Storage {
 		executor: PostgresQueryable,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
 		existingByID: ReadonlyMap<DocumentId, DocumentRecord>,
+		versions: ReadonlyMap<DocumentId, number>,
 	): Promise<void> {
 		const liveCounts = new Map<string, number>();
 		for (const [id, action] of actions) {
@@ -864,15 +1130,9 @@ export class PostgresStorage implements Storage {
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
 			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
 			if (action.content?.kind === "delta") {
-				const previous = (
-					await executor.query<{ readonly version: number }>(
-						`SELECT version FROM ${this.tables.revisions}
-							WHERE session_id = $1 AND document_id = $2 ORDER BY seq DESC LIMIT 1`,
-						[this.session, id],
-					)
-				).rows[0];
+				const previous = versions.get(id);
 				if (previous === undefined) throw new Error(`Document ${id} delta has no base`);
-				if (previous.version !== action.content.version) {
+				if (previous !== action.content.version) {
 					throw new Error(`Document ${id} version transition requires a base`);
 				}
 			}
@@ -920,7 +1180,14 @@ export class PostgresStorage implements Storage {
 		existing: ReadonlyMap<DocumentId, DocumentRecord>,
 		seq: Seq,
 	): Promise<DocumentWrites> {
-		const writes: DocumentWrites = { claims: [], inserts: [], retirements: [], clearRevisions: [], revisions: [] };
+		const writes: DocumentWrites = {
+			claims: [],
+			inserts: [],
+			retirements: [],
+			clearRevisions: [],
+			revisions: [],
+			applied: new Map(),
+		};
 		for (const [id, action] of actions) {
 			let content = action.content;
 			if (action.copy !== undefined) {
@@ -976,6 +1243,7 @@ export class PostgresStorage implements Storage {
 				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
 				writes.revisions.push([this.session, id, seq, content.kind, content.version, encodedContent]);
 			}
+			writes.applied.set(id, { record, content: retiredCurrentOnly ? undefined : content });
 		}
 		return writes;
 	}

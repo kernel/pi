@@ -4,9 +4,9 @@
 
 ### Changed
 
-- Postgres storage commits a batch in one transaction of a few set-based statements instead of one statement per record: ids are checked and claimed as sets, each table's rows are inserted in one multi-row statement, documents are read once, and revisions are cleared and added together, all in a single data-modifying CTE statement that also advances the session. Admitting one input drops from 22 queries to 6; creating a conversation from 37 to 13.
-- Postgres storage caches the conversation records it has read; the storage is a Session's only writer and conversation records are only inserted, so a record stays valid until this storage writes it.
-- `PostgresStorage.open` takes `migrate: false` to skip the schema check for deployments that migrate in an explicit step.
+- Postgres storage is built for a database that is a network hop away. A commit is two round trips: one statement reads the session row, the batch's claimed ids, its documents, and their latest revision versions as JSON; one data-modifying CTE statement writes every table's rows, clears and adds revisions, and advances the session, each part gated on the session still carrying this owner at the sequence the read observed. A single statement is atomic, so no transaction brackets a commit, and a takeover by another process writes nothing and is reported as before.
+- Postgres storage serves repeated reads from memory. It is the Session's only writer, so a record it has read stays valid until it writes that record: conversation records, tasks and submissions by id and request, each conversation's newest entries and head markers, current document scans and addresses, and the materialized current content of documents are cached and kept current by every commit. Measured on one faux-model turn, admitting an input drops from 22 queries to 3, creating a conversation from 37 to 11, a plain turn from 61 to 9, and a turn with one tool call from 189 to 31.
+- `PostgresStorage.open` takes `migrate: false` to skip the schema check for deployments that migrate in an explicit step; an open is then two statements.
 
 
 ### Breaking Changes
