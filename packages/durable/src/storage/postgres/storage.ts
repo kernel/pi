@@ -31,49 +31,42 @@ import type {
 	TaskQuery,
 	TaskRecord,
 } from "../../types.ts";
-import {
-	inTransaction,
-	type PostgresPool,
-	type PostgresPoolClient,
-	type PostgresQueryable,
-	type PostgresValue,
-} from "./database.ts";
+import type { PostgresPool, PostgresPoolClient, PostgresQueryable, PostgresValue } from "./database.ts";
 import { applyPostgresMigrations, DEFAULT_POSTGRES_SCHEMA, quoteIdentifier } from "./migrations.ts";
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type TableName = "conversation" | "entry" | "task" | "submission" | "document";
 type JsonRow = { readonly record: string };
 type EntryJsonRow = { readonly record: string; readonly commit_seq: string };
-type RevisionRow = {
-	readonly seq: string;
-	readonly kind: DocumentContent["kind"];
-	readonly version: number;
-	readonly content: string;
-};
-type IdRow = { readonly id: string };
 type MetadataRow = { readonly next_id: string; readonly next_seq: string };
 /** A conversation's own entries over one contiguous id range ending at its newest entry, newest-last. */
 type EntryWindow = { ids: EntryId[]; complete: boolean };
 type DocumentState = { readonly record: string; readonly version: number; value: JsonObject; deltasSinceBase: number };
-type CommitState = {
-	readonly session:
-		| { readonly next_id: number | string; readonly next_seq: number | string; readonly owner: string }
-		| undefined;
-	readonly ids: ReadonlyMap<Id<string>, TableName>;
-	readonly documents: ReadonlyMap<DocumentId, DocumentRecord>;
-	readonly versions: ReadonlyMap<DocumentId, number>;
-};
 type DocumentWrites = {
 	readonly claims: DocumentId[];
-	readonly inserts: PostgresValue[][];
-	readonly retirements: PostgresValue[][];
-	readonly clearRevisions: DocumentId[];
-	readonly revisions: PostgresValue[][];
-	/** The record as written and the content applied, per document, for the caches. */
+	readonly rows: unknown[];
+	/** What each document action means for the caches once the commit succeeds. */
 	readonly applied: Map<
 		DocumentId,
-		{ readonly record: DocumentRecord; readonly content: DocumentContent | undefined }
+		{
+			readonly created: DocumentRecord | undefined;
+			readonly retired: boolean;
+			readonly content: DocumentContent | undefined;
+		}
 	>;
+};
+
+/** SQLSTATEs the commit function raises, each for one adapter error. */
+const commitErrorCodes: Readonly<Record<string, true>> = {
+	DU001: true,
+	DU002: true,
+	DU003: true,
+	DU004: true,
+	DU005: true,
+	DU006: true,
+	DU007: true,
+	DU008: true,
+	DU009: true,
 };
 type DocumentAction = {
 	create?: DocumentCreate;
@@ -162,15 +155,6 @@ const isAliveAt = (record: DocumentRecord, at: DocumentPoint): boolean => {
 const isCurrentOnly = (record: DocumentRecord): boolean =>
 	record.scope.kind !== "conversation" || record.history === "latest";
 
-// Column types of each table's insert list, for casting VALUES parameters.
-const RECORD_ID_TYPES = ["text", "bigint", "text"];
-const CONVERSATION_TYPES = ["text", "bigint", "bigint", "bigint", "json"];
-const ENTRY_TYPES = ["text", "bigint", "bigint", "bigint", "bigint", "json"];
-const TASK_TYPES = ["text", "bigint", "bigint", "text", "text", "boolean", "boolean", "json"];
-const SUBMISSION_TYPES = ["text", "bigint", "bigint", "text", "text", "json"];
-const DOCUMENT_TYPES = ["text", "bigint", "text", "smallint", "text", "text", "bigint", "bigint", "bigint", "json"];
-const REVISION_TYPES = ["text", "bigint", "bigint", "text", "integer", "json"];
-
 /** Entries loaded per conversation on first use, and the most kept as commits extend the window. */
 const ENTRY_WINDOW_LOAD = 256;
 const ENTRY_WINDOW_MAX = 1024;
@@ -188,9 +172,6 @@ const upperBound = (values: readonly number[], value: number): number => {
 	}
 	return low;
 };
-
-/** A Postgres array literal of record ids, for `= ANY($n::bigint[])` with the adapter's scalar parameter type. */
-const arrayLiteral = (ids: readonly number[]): string => `{${[...new Set(ids)].join(",")}}`;
 
 const writeId = (write: StorageWrite): Id<string> | undefined => {
 	switch (write.type) {
@@ -226,6 +207,9 @@ export class PostgresStorage implements Storage {
 	private readonly owner: string;
 	private readonly tables: Tables;
 	private nextId: number;
+	/** The sequence the next commit takes. This storage is the session's only writer, so it advances by one per commit. */
+	private nextSeq: number;
+	private readonly commitFunction: string;
 	private closed = false;
 	private lost: Error | undefined;
 	private closing: Promise<void> | undefined;
@@ -239,7 +223,9 @@ export class PostgresStorage implements Storage {
 	// kept JSON-encoded so a caller gets a detached object each time, as from the database.
 	private readonly tasks = new Map<TaskId, string>();
 	private readonly submissions = new Map<SubmissionId, string>();
-	private readonly submissionsByRequest = new Map<string, SubmissionId>();
+	// A request key with no submission is remembered too: nothing else can create one, so a miss stays a miss
+	// until this storage commits that submission.
+	private readonly submissionsByRequest = new Map<string, SubmissionId | null>();
 	private readonly entries = new Map<EntryId, { readonly record: string; readonly commitSeq: Seq }>();
 	private readonly entryWindows = new Map<ConversationId, EntryWindow>();
 	private readonly headMarkers = new Map<ConversationId, EntryId[]>();
@@ -253,7 +239,7 @@ export class PostgresStorage implements Storage {
 		pool: PostgresPool,
 		lockClient: PostgresPoolClient,
 		onLockError: (error: Error) => void,
-		options: { session: string; schema: string; lockKey: string; owner: string; nextId: number },
+		options: { session: string; schema: string; lockKey: string; owner: string; nextId: number; nextSeq: number },
 	) {
 		this.pool = pool;
 		this.lockClient = lockClient;
@@ -262,7 +248,9 @@ export class PostgresStorage implements Storage {
 		this.lockKey = options.lockKey;
 		this.owner = options.owner;
 		this.nextId = options.nextId;
+		this.nextSeq = options.nextSeq;
 		const schema = quoteIdentifier(options.schema);
+		this.commitFunction = `${schema}.commit_batch`;
 		this.tables = {
 			sessions: `${schema}.sessions`,
 			recordIds: `${schema}.record_ids`,
@@ -319,6 +307,7 @@ export class PostgresStorage implements Storage {
 				lockKey: key,
 				owner,
 				nextId: Number(metadata.next_id),
+				nextSeq: Number(metadata.next_seq),
 			});
 			if (lockError !== undefined) storage.loseLock(lockError);
 			return storage;
@@ -342,85 +331,107 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const documentActions = this.prepareDocumentActions(writes);
 			const candidateNextId = this.candidateNextId(writes);
-			// Two round trips: one read of everything the checks need, then one statement that writes the whole
-			// batch. A single statement is atomic by itself, so no transaction brackets it; the write is gated on
-			// this storage still owning the session at the sequence the read observed, which is what the row lock
-			// used to guarantee.
-			const state = await this.readCommitState(writes, documentActions);
-			if (state.session === undefined) throw new Error("Durable Postgres session metadata is missing");
-			if (state.session.owner !== this.owner) {
-				const error = new Error(`Durable Postgres session ${this.session} was opened by another process`);
-				this.loseLock(error);
-				throw error;
+			this.checkBatchIds(writes);
+			const seq = seqFromNumber(this.nextSeq);
+			const documentWrites = await this.prepareDocumentWrites(documentActions, seq);
+			// One round trip: the commit function locks the session row, checks that this storage still owns it
+			// at the sequence it expects, validates the batch against the stored state, and writes every table.
+			try {
+				await this.pool.query(`SELECT ${this.commitFunction}($1, $2, $3, $4, $5::json)`, [
+					this.session,
+					this.owner,
+					seq,
+					candidateNextId,
+					this.encodeBatch(writes, documentWrites),
+				]);
+			} catch (error) {
+				throw this.commitError(error);
 			}
-			const committedSeq = seqFromNumber(Number(state.session.next_seq));
-			this.checkGlobalIds(writes, state.ids);
-			await this.checkDocumentActions(this.pool, documentActions, state.documents, state.versions);
-			const documentWrites = await this.prepareDocumentWrites(
-				this.pool,
-				documentActions,
-				state.documents,
-				committedSeq,
-			);
-			const written = await this.writeBatch(this.pool, writes, documentWrites, committedSeq, {
-				nextId: Math.max(Number(state.session.next_id), candidateNextId),
-				nextSeq: committedSeq + 1,
-				expectedSeq: committedSeq,
-			});
-			if (!written) {
-				const error = new Error(`Durable Postgres session ${this.session} was opened by another process`);
-				this.loseLock(error);
-				throw error;
-			}
+			this.nextSeq = seq + 1;
 			this.nextId = Math.max(this.nextId, candidateNextId);
-			this.absorb(writes, documentActions, documentWrites, committedSeq);
-			return committedSeq;
+			this.absorb(writes, documentActions, documentWrites, seq);
+			return seq;
 		});
 	}
 
-	/** Everything a commit checks before writing, read in one statement: the session row, the batch's claimed ids, and its documents. */
-	private async readCommitState(
-		writes: readonly StorageWrite[],
-		actions: ReadonlyMap<DocumentId, DocumentAction>,
-	): Promise<CommitState> {
-		const ids = new Set<number>();
-		for (const write of writes) {
-			const id = writeId(write);
-			if (id !== undefined) ids.add(id);
+	/** Maps an error raised by the commit function to the adapter's own errors; other errors pass through. */
+	private commitError(error: unknown): unknown {
+		const code = (error as { readonly code?: unknown }).code;
+		const message = (error as { readonly message?: unknown }).message;
+		if (typeof code !== "string" || typeof message !== "string" || !(code in commitErrorCodes)) return error;
+		if (code === "DU002") {
+			const lost = new Error(message);
+			this.loseLock(lost);
+			return lost;
 		}
-		const deltas = [...actions].filter(([, action]) => action.content?.kind === "delta").map(([id]) => id);
-		const row = (
-			await this.pool.query<{ readonly state: string }>(
-				`SELECT json_build_object(
-					'session', (SELECT row_to_json(s) FROM ${this.tables.sessions} s WHERE s.session_id = $1),
-					'ids', (SELECT coalesce(json_agg(json_build_object('id', r.id, 'type', r.record_type)), '[]'::json)
-						FROM ${this.tables.recordIds} r WHERE r.session_id = $1 AND r.id = ANY($2::bigint[])),
-					'documents', (SELECT coalesce(json_agg(json_build_object('id', d.id, 'record', d.record)), '[]'::json)
-						FROM ${this.tables.documents} d WHERE d.session_id = $1 AND d.id = ANY($3::bigint[])),
-					'versions', (SELECT coalesce(json_agg(json_build_object('id', v.document_id, 'version', v.version)), '[]'::json)
-						FROM (SELECT DISTINCT ON (document_id) document_id, version FROM ${this.tables.revisions}
-							WHERE session_id = $1 AND document_id = ANY($4::bigint[]) ORDER BY document_id, seq DESC) v)
-				)::text AS state`,
-				[this.session, arrayLiteral([...ids]), arrayLiteral([...actions.keys()]), arrayLiteral(deltas)],
-			)
-		).rows[0];
-		const raw = parseJson<{
-			readonly session: {
-				readonly next_id: number | string;
-				readonly next_seq: number | string;
-				readonly owner: string;
-			} | null;
-			readonly ids: readonly { readonly id: number | string; readonly type: TableName }[];
-			readonly documents: readonly { readonly id: number | string; readonly record: DocumentRecord }[];
-			readonly versions: readonly { readonly id: number | string; readonly version: number }[];
-		}>(row.state);
-		const existingIds = new Map<Id<string>, TableName>();
-		for (const entry of raw.ids) existingIds.set(idFromNumber<Id<string>>(Number(entry.id)), entry.type);
-		const documents = new Map<DocumentId, DocumentRecord>();
-		for (const entry of raw.documents) documents.set(idFromNumber<DocumentId>(Number(entry.id)), entry.record);
-		const versions = new Map<DocumentId, number>();
-		for (const entry of raw.versions) versions.set(idFromNumber<DocumentId>(Number(entry.id)), entry.version);
-		return { session: raw.session ?? undefined, ids: existingIds, documents, versions };
+		return new Error(message);
+	}
+
+	/** The batch as the commit function reads it. Records and content go as JSON text, cast to `json` on insert. */
+	private encodeBatch(writes: readonly StorageWrite[], documents: DocumentWrites): string {
+		const claims = new Map<Id<string>, TableName>();
+		const conversations: unknown[] = [];
+		const entries: unknown[] = [];
+		const tasks = new Map<Id<string>, unknown>();
+		const submissions = new Map<Id<string>, unknown>();
+		for (const write of writes) {
+			switch (write.type) {
+				case "conversation":
+					claims.set(write.value.id, "conversation");
+					conversations.push({
+						id: write.value.id,
+						owner_conversation_id: write.value.owner?.conversationId ?? null,
+						owner_task_id: write.value.owner?.taskId ?? null,
+						record: encodeJson(write.value),
+					});
+					break;
+				case "entry":
+					claims.set(write.value.id, "entry");
+					entries.push({
+						id: write.value.id,
+						conversation_id: write.value.conversationId,
+						head: write.value.head ?? null,
+						record: encodeJson(write.value),
+					});
+					break;
+				case "task":
+					claims.set(write.value.id, "task");
+					tasks.set(write.value.id, {
+						id: write.value.id,
+						conversation_id: write.value.conversationId,
+						kind: encodeIndexedString(write.value.kind),
+						status: write.value.state.status,
+						abort_requested: write.value.abortRequested,
+						background: write.value.background,
+						record: encodeJson(write.value),
+					});
+					break;
+				case "submission":
+					claims.set(write.value.id, "submission");
+					submissions.set(write.value.id, {
+						id: write.value.id,
+						conversation_id: write.value.conversationId,
+						request_id: write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
+						status: write.value.status,
+						record: encodeJson(write.value),
+					});
+					break;
+				case "document.create":
+				case "document.copy":
+				case "document.change":
+				case "document.retire":
+					break;
+			}
+		}
+		for (const id of documents.claims) claims.set(id, "document");
+		return encodeJson({
+			claims: [...claims].map(([id, type]) => ({ id, type })),
+			conversations,
+			entries,
+			tasks: [...tasks.values()],
+			submissions: [...submissions.values()],
+			documents: documents.rows,
+		});
 	}
 
 	async mintId<I extends Id<string>>(): Promise<I> {
@@ -702,15 +713,16 @@ export class PostgresStorage implements Storage {
 			}
 		}
 		if (actions.size === 0) return;
-		for (const [id, { record, content }] of documents.applied) {
-			if (record.retiredAt !== undefined) {
+		for (const [id, { created, retired, content }] of documents.applied) {
+			if (retired) {
 				this.documentStates.delete(id);
 				continue;
 			}
 			const state = this.documentStates.get(id);
-			if (content?.kind === "base") {
+			const record = created !== undefined ? encodeJson(created) : state?.record;
+			if (content?.kind === "base" && record !== undefined) {
 				this.documentStates.set(id, {
-					record: encodeJson(record),
+					record,
 					version: content.version,
 					value: parseJson<JsonObject>(encodeJson(content.value)),
 					deltasSinceBase: 0,
@@ -723,7 +735,11 @@ export class PostgresStorage implements Storage {
 			}
 		}
 		// Creating or retiring a document changes what an address or scope scan resolves to.
-		if (documents.inserts.length > 0 || documents.retirements.length > 0) {
+		if (
+			documents.rows.some(
+				(row) => (row as { is_create: boolean; retire: boolean }).is_create || (row as { retire: boolean }).retire,
+			)
+		) {
 			this.documentScans = new Map();
 			this.documentAddresses = new Map();
 		}
@@ -816,7 +832,9 @@ export class PostgresStorage implements Storage {
 		_context: Context,
 	): Promise<SubmissionRecord | undefined> {
 		return this.admit(async () => {
-			const cachedId = this.submissionsByRequest.get(requestKey(conversationId, requestId));
+			const key = requestKey(conversationId, requestId);
+			const cachedId = this.submissionsByRequest.get(key);
+			if (cachedId === null) return undefined;
 			const cached = cachedId === undefined ? undefined : this.submissions.get(cachedId);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
 			const [record] = await this.records(
@@ -825,6 +843,7 @@ export class PostgresStorage implements Storage {
 				[this.session, conversationId, encodeIndexedString(requestId)],
 			);
 			if (record !== undefined) this.rememberSubmission(record);
+			else this.submissionsByRequest.set(key, null);
 			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
 		});
 	}
@@ -874,10 +893,7 @@ export class PostgresStorage implements Storage {
 					};
 				}
 			}
-			// The record and revision queries must observe one committed state; a commit between them can replace the base.
-			const stored = await inTransaction(this.pool, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", (client) =>
-				this.materializeDocument(client, id, at),
-			);
+			const stored = await this.materializeDocument(id, at);
 			if (at === "current" && stored !== undefined) {
 				this.documentStates.set(id, {
 					record: encodeJson(stored.record),
@@ -998,40 +1014,46 @@ export class PostgresStorage implements Storage {
 		return record;
 	}
 
-	private async materializeDocument(
-		executor: PostgresQueryable,
-		id: DocumentId,
-		at: DocumentPoint,
-	): Promise<StoredDocument | undefined> {
-		const record = await this.recordById<DocumentRecord>(this.tables.documents, id, executor);
-		if (record === undefined) return undefined;
+	/** One statement reads the record and the revisions from the newest base at or before `at`. */
+	private async materializeDocument(id: DocumentId, at: DocumentPoint): Promise<StoredDocument | undefined> {
+		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
+		const row = (
+			await this.pool.query<{ readonly record: string | null; readonly revisions: string | null }>(
+				`SELECT (SELECT x.record::text FROM ${this.tables.documents} x WHERE x.session_id = $1 AND x.id = $2) AS record,
+					(SELECT json_agg(json_build_object('seq', r.seq, 'kind', r.kind, 'version', r.version, 'content', r.content)
+						ORDER BY r.seq)::text
+					 FROM ${this.tables.revisions} r WHERE r.session_id = $1 AND r.document_id = $2 AND r.seq <= $3
+						AND r.seq >= (SELECT b.seq FROM ${this.tables.revisions} b WHERE b.session_id = $1 AND b.document_id = $2
+							AND b.kind = 'base' AND b.seq <= $3 ORDER BY b.seq DESC LIMIT 1)) AS revisions`,
+				[this.session, id, upper],
+			)
+		).rows[0];
+		if (row?.record === null || row?.record === undefined) return undefined;
+		const record = parseJson<DocumentRecord>(row.record);
 		if (at !== "current" && isCurrentOnly(record)) {
 			throw new Error(`Document ${id} does not retain historical content`);
 		}
 		if (!isAliveAt(record, at)) return undefined;
-		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
-		const base = (
-			await executor.query<RevisionRow>(
-				`SELECT seq, kind, version, content::text AS content FROM ${this.tables.revisions}
-					WHERE session_id = $1 AND document_id = $2 AND kind = 'base' AND seq <= $3
-					ORDER BY seq DESC LIMIT 1`,
-				[this.session, id, upper],
-			)
-		).rows[0];
-		if (base === undefined) throw new Error(`Document ${id} is missing a required base`);
-		let value = parseJson<JsonObject>(base.content);
-		const tail = (
-			await executor.query<RevisionRow>(
-				`SELECT seq, kind, version, content::text AS content FROM ${this.tables.revisions}
-					WHERE session_id = $1 AND document_id = $2 AND seq > $3 AND seq <= $4 ORDER BY seq`,
-				[this.session, id, Number(base.seq), upper],
-			)
-		).rows;
+		const revisions =
+			row.revisions === null
+				? []
+				: parseJson<
+						readonly {
+							readonly seq: number;
+							readonly kind: DocumentContent["kind"];
+							readonly version: number;
+							readonly content: JsonValue;
+						}[]
+					>(row.revisions);
+		const base = revisions[0];
+		if (base === undefined || base.kind !== "base") throw new Error(`Document ${id} is missing a required base`);
+		let value = base.content as JsonObject;
+		const tail = revisions.slice(1);
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version) {
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
 			}
-			value = apply(value, parseJson<readonly Op[]>(revision.content)) as JsonObject;
+			value = apply(value, revision.content as unknown as readonly Op[]) as JsonObject;
 		}
 		return { record, version: base.version, value, deltasSinceBase: tail.length };
 	}
@@ -1045,22 +1067,19 @@ export class PostgresStorage implements Storage {
 		return nextId;
 	}
 
-	private checkGlobalIds(writes: readonly StorageWrite[], existingByID: ReadonlyMap<Id<string>, TableName>): void {
+	/** The batch-internal id rules; whether an id already belongs to a stored record is the commit function's check. */
+	private checkBatchIds(writes: readonly StorageWrite[]): void {
 		const claimed = new Map<Id<string>, TableName>();
 		for (const write of writes) {
 			if (write.type === "document.change" || write.type === "document.retire") continue;
 			const document = write.type === "document.create" || write.type === "document.copy";
 			const table: TableName = document ? "document" : write.type;
 			const id = document ? write.record.id : write.value.id;
-			const existing = existingByID.get(id);
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
-				if (existing !== undefined) throw new Error(`ID ${id} already belongs to ${existing}`);
 				if (earlier !== undefined) throw new Error(`ID ${id} is written more than once`);
-			} else {
-				if (existing !== undefined && existing !== table)
-					throw new Error(`ID ${id} already belongs to ${existing}`);
-				if (earlier !== undefined && earlier !== table) throw new Error(`ID ${id} is written as two record types`);
+			} else if (earlier !== undefined && earlier !== table) {
+				throw new Error(`ID ${id} is written as two record types`);
 			}
 			claimed.set(id, table);
 		}
@@ -1113,86 +1132,24 @@ export class PostgresStorage implements Storage {
 		return actions;
 	}
 
-	/** Validates the batch's document actions against the records read for them. */
-	private async checkDocumentActions(
-		executor: PostgresQueryable,
+	/**
+	 * Resolves the batch's document actions into the rows the commit function takes, reading copy sources here.
+	 * A created record carries its sequence; an existing document's retirement and any history clearing are the
+	 * function's to apply, since it holds the stored record.
+	 */
+	private async prepareDocumentWrites(
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
-		existingByID: ReadonlyMap<DocumentId, DocumentRecord>,
-		versions: ReadonlyMap<DocumentId, number>,
-	): Promise<void> {
-		const liveCounts = new Map<string, number>();
+		seq: Seq,
+	): Promise<DocumentWrites> {
+		const writes: DocumentWrites = { claims: [], rows: [], applied: new Map() };
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id)) {
 				throw new StorageRejected(`Document copy ${id} source is changed in the copy batch`);
 			}
-			const existing = existingByID.get(id);
-			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
-			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
-			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
-			if (action.content?.kind === "delta") {
-				const previous = versions.get(id);
-				if (previous === undefined) throw new Error(`Document ${id} delta has no base`);
-				if (previous !== action.content.version) {
-					throw new Error(`Document ${id} version transition requires a base`);
-				}
-			}
-			// Only a create or retire can change how many incarnations an address has; a content change on an
-			// existing document needs no lookup.
-			if (action.create === undefined && !action.retire) continue;
-			const record = action.create ?? existing!;
-			const key = addressKey(record);
-			let live = liveCounts.get(key);
-			if (live === undefined) live = (await this.currentDocumentId(executor, record)) === undefined ? 0 : 1;
-			if (action.retire && existing !== undefined) live--;
-			if (action.create !== undefined && !action.retire) live++;
-			liveCounts.set(key, live);
-		}
-		for (const live of liveCounts.values()) {
-			if (live > 1) throw new Error("Document address already has a current incarnation");
-		}
-	}
-
-	private async currentDocumentId(
-		executor: PostgresQueryable,
-		address: DocumentAddress | DocumentCreate | DocumentRecord,
-	): Promise<DocumentId | undefined> {
-		const parts = addressParts(address);
-		const id = (
-			await executor.query<IdRow>(
-				`SELECT id FROM ${this.tables.documents}
-					WHERE session_id = $1 AND kind = $2 AND scope_kind = $3 AND owner_id = $4 AND family = $5
-					AND key_value = $6 AND retired_at IS NULL
-					LIMIT 1`,
-				[this.session, parts.kind, parts.scopeKind, parts.ownerId, parts.family, parts.keyValue],
-			)
-		).rows[0]?.id;
-		return id === undefined ? undefined : idFromNumber<DocumentId>(Number(id));
-	}
-
-	/**
-	 * Resolves the batch's document actions into rows: records to insert, retirements to apply to existing
-	 * documents, revision histories to clear, and revisions to add. Copy sources are read here; the rows are
-	 * written with everything else in `writeBatch`.
-	 */
-	private async prepareDocumentWrites(
-		executor: PostgresQueryable,
-		actions: ReadonlyMap<DocumentId, DocumentAction>,
-		existing: ReadonlyMap<DocumentId, DocumentRecord>,
-		seq: Seq,
-	): Promise<DocumentWrites> {
-		const writes: DocumentWrites = {
-			claims: [],
-			inserts: [],
-			retirements: [],
-			clearRevisions: [],
-			revisions: [],
-			applied: new Map(),
-		};
-		for (const [id, action] of actions) {
 			let content = action.content;
 			if (action.copy !== undefined) {
 				try {
-					const stored = await this.materializeDocument(executor, action.copy.id, action.copy.at);
+					const stored = await this.materializeDocument(action.copy.id, action.copy.at);
 					if (stored === undefined) throw new Error(`Fork source document ${action.copy.id} cannot be read`);
 					const create = action.create!;
 					if (
@@ -1211,185 +1168,30 @@ export class PostgresStorage implements Storage {
 					throw new StorageRejected(`Document copy ${id} was rejected`, { cause: error });
 				}
 			}
-			let record: DocumentRecord;
+			let created: DocumentRecord | undefined;
+			let parts: ReturnType<typeof addressParts> | undefined;
 			if (action.create !== undefined) {
-				record = { ...action.create, createdAt: seq, ...(action.retire ? { retiredAt: seq } : {}) };
-				const parts = addressParts(record);
+				created = { ...action.create, createdAt: seq, ...(action.retire ? { retiredAt: seq } : {}) };
+				parts = addressParts(created);
 				writes.claims.push(id);
-				writes.inserts.push([
-					this.session,
-					id,
-					parts.kind,
-					parts.family,
-					parts.keyValue,
-					parts.scopeKind,
-					parts.ownerId,
-					seq,
-					action.retire ? seq : null,
-					encodeJson(record),
-				]);
-			} else {
-				record = existing.get(id)!;
-				if (action.retire) {
-					record = { ...record, retiredAt: seq };
-					writes.retirements.push([this.session, id, seq, encodeJson(record)]);
-				}
 			}
-			// A retired current-only document keeps no revisions, so one written in the same batch would only be
-			// deleted again and is skipped. A base otherwise replaces a current-only document's history.
-			const retiredCurrentOnly = action.retire && isCurrentOnly(record);
-			if (retiredCurrentOnly || (content?.kind === "base" && isCurrentOnly(record))) writes.clearRevisions.push(id);
-			if (content !== undefined && !retiredCurrentOnly) {
-				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
-				writes.revisions.push([this.session, id, seq, content.kind, content.version, encodedContent]);
-			}
-			writes.applied.set(id, { record, content: retiredCurrentOnly ? undefined : content });
+			writes.rows.push({
+				id,
+				is_create: created !== undefined,
+				retire: action.retire,
+				kind: parts?.kind ?? null,
+				family: parts?.family ?? null,
+				key_value: parts?.keyValue ?? null,
+				scope_kind: parts?.scopeKind ?? null,
+				owner_id: parts?.ownerId ?? null,
+				record: created === undefined ? null : encodeJson(created),
+				content_kind: content?.kind ?? null,
+				version: content?.version ?? null,
+				content: content === undefined ? null : encodeJson(content.kind === "base" ? content.value : content.ops),
+			});
+			writes.applied.set(id, { created, retired: action.retire, content });
 		}
 		return writes;
-	}
-
-	/**
-	 * Writes the whole batch in one statement: data-modifying CTEs claim every new id, insert each table's rows,
-	 * clear and add revisions, and the statement's final UPDATE advances the session. A task or submission written
-	 * twice in one batch keeps its last write, as serial upserts did. Retiring an existing document is the one
-	 * action written separately, since it updates rows that may also be read by the batch's other actions.
-	 */
-	private async writeBatch(
-		executor: PostgresQueryable,
-		writes: readonly StorageWrite[],
-		documents: DocumentWrites,
-		seq: Seq,
-		session: { readonly nextId: number; readonly nextSeq: number; readonly expectedSeq: number },
-	): Promise<boolean> {
-		const claims = new Map<Id<string>, TableName>();
-		const conversations: PostgresValue[][] = [];
-		const entries: PostgresValue[][] = [];
-		const tasks = new Map<Id<string>, PostgresValue[]>();
-		const submissions = new Map<Id<string>, PostgresValue[]>();
-		for (const write of writes) {
-			switch (write.type) {
-				case "conversation":
-					claims.set(write.value.id, "conversation");
-					conversations.push([
-						this.session,
-						write.value.id,
-						write.value.owner?.conversationId ?? null,
-						write.value.owner?.taskId ?? null,
-						encodeJson(write.value),
-					]);
-					break;
-				case "entry":
-					claims.set(write.value.id, "entry");
-					entries.push([
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						write.value.head ?? null,
-						seq,
-						encodeJson(write.value),
-					]);
-					break;
-				case "task":
-					claims.set(write.value.id, "task");
-					tasks.set(write.value.id, [
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						encodeIndexedString(write.value.kind),
-						write.value.state.status,
-						write.value.abortRequested,
-						write.value.background,
-						encodeJson(write.value),
-					]);
-					break;
-				case "submission":
-					claims.set(write.value.id, "submission");
-					submissions.set(write.value.id, [
-						this.session,
-						write.value.id,
-						write.value.conversationId,
-						write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
-						write.value.status,
-						encodeJson(write.value),
-					]);
-					break;
-				case "document.create":
-				case "document.copy":
-				case "document.change":
-				case "document.retire":
-					break;
-			}
-		}
-		for (const id of documents.claims) claims.set(id, "document");
-
-		// Every write is gated on the guard: the session row still carries this owner at the sequence the
-		// pre-read observed. When another process has taken the session over, every CTE writes nothing and the
-		// final UPDATE affects no row.
-		const params: PostgresValue[] = [this.session, this.owner, session.expectedSeq];
-		const guard = `WHERE EXISTS (SELECT 1 FROM guard)`;
-		// Parameters in a VALUES subselect carry no type inference, so each column is cast to its table type.
-		const values = (rows: readonly (readonly PostgresValue[])[], casts: readonly string[]): string => {
-			const names = casts.map((_, index) => `c${index}`).join(", ");
-			const list = rows
-				.map((row) => `(${row.map((value, index) => `$${params.push(value)}::${casts[index]}`).join(", ")})`)
-				.join(", ");
-			return `SELECT ${names} FROM (VALUES ${list}) AS v(${names}) ${guard}`;
-		};
-		const parts: string[] = [
-			`guard AS (SELECT 1 FROM ${this.tables.sessions} WHERE session_id = $1 AND owner = $2 AND next_seq = $3)`,
-		];
-		for (const [, id, retiredAt, record] of documents.retirements) {
-			parts.push(`retire_${id} AS (UPDATE ${this.tables.documents} SET retired_at = $${params.push(retiredAt)}::bigint,
-				record = $${params.push(record)}::json WHERE session_id = $1 AND id = $${params.push(id)}::bigint AND EXISTS (SELECT 1 FROM guard))`);
-		}
-		if (claims.size > 0) {
-			parts.push(`claims AS (INSERT INTO ${this.tables.recordIds} (session_id, id, record_type)
-				${values(
-					[...claims].map(([id, table]) => [this.session, id, table]),
-					RECORD_ID_TYPES,
-				)}
-				ON CONFLICT (session_id, id) DO NOTHING)`);
-		}
-		if (conversations.length > 0) {
-			parts.push(`conversations AS (INSERT INTO ${this.tables.conversations}
-				(session_id, id, owner_conversation_id, owner_task_id, record) ${values(conversations, CONVERSATION_TYPES)})`);
-		}
-		if (entries.length > 0) {
-			parts.push(`entries AS (INSERT INTO ${this.tables.entries}
-				(session_id, id, conversation_id, head, commit_seq, record) ${values(entries, ENTRY_TYPES)})`);
-		}
-		if (tasks.size > 0) {
-			parts.push(`tasks AS (INSERT INTO ${this.tables.tasks}
-				(session_id, id, conversation_id, kind, status, abort_requested, background, record)
-				${values([...tasks.values()], TASK_TYPES)}
-				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-				kind = excluded.kind, status = excluded.status, abort_requested = excluded.abort_requested,
-				background = excluded.background, record = excluded.record)`);
-		}
-		if (submissions.size > 0) {
-			parts.push(`submissions AS (INSERT INTO ${this.tables.submissions}
-				(session_id, id, conversation_id, request_id, status, record) ${values([...submissions.values()], SUBMISSION_TYPES)}
-				ON CONFLICT (session_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
-				request_id = excluded.request_id, status = excluded.status, record = excluded.record)`);
-		}
-		if (documents.inserts.length > 0) {
-			parts.push(`documents AS (INSERT INTO ${this.tables.documents}
-				(session_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-				${values(documents.inserts, DOCUMENT_TYPES)})`);
-		}
-		if (documents.clearRevisions.length > 0) {
-			parts.push(`cleared AS (DELETE FROM ${this.tables.revisions}
-				WHERE session_id = $1 AND document_id = ANY($${params.push(arrayLiteral(documents.clearRevisions))}::bigint[])
-				AND EXISTS (SELECT 1 FROM guard))`);
-		}
-		if (documents.revisions.length > 0) {
-			parts.push(`revisions AS (INSERT INTO ${this.tables.revisions}
-				(session_id, document_id, seq, kind, version, content) ${values(documents.revisions, REVISION_TYPES)})`);
-		}
-		const update = `UPDATE ${this.tables.sessions} SET next_id = $${params.push(session.nextId)}, next_seq = $${params.push(session.nextSeq)}
-			WHERE session_id = $1 AND owner = $2 AND next_seq = $3`;
-		const result = await executor.query(`WITH ${parts.join(",\n")} ${update}`, params);
-		return (result.rowCount ?? 0) > 0;
 	}
 
 	private assertOpen(): void {
