@@ -734,15 +734,34 @@ export class PostgresStorage implements Storage {
 				this.documentStates.delete(id);
 			}
 		}
-		// Creating or retiring a document changes what an address or scope scan resolves to.
-		if (
-			documents.rows.some(
-				(row) => (row as { is_create: boolean; retire: boolean }).is_create || (row as { retire: boolean }).retire,
-			)
-		) {
-			this.documentScans = new Map();
-			this.documentAddresses = new Map();
+		// Creating or retiring a document changes what an address or scope scan in its scope resolves to. A
+		// retirement of a document whose scope is not known here invalidates every scope.
+		for (const [id, { created, retired }] of documents.applied) {
+			if (created === undefined && !retired) continue;
+			const scope = created !== undefined ? scopeColumns(created.scope) : this.cachedDocumentScope(id);
+			if (scope === undefined) {
+				this.documentScans = new Map();
+				this.documentAddresses = new Map();
+				break;
+			}
+			const scanPrefix = `${scope.scopeKind}:${scope.ownerId}:`;
+			for (const key of [...this.documentScans.keys()])
+				if (key.startsWith(scanPrefix)) this.documentScans.delete(key);
+			const addressMark = `,"${scope.scopeKind}",${scope.ownerId},`;
+			for (const key of [...this.documentAddresses.keys()])
+				if (key.includes(addressMark)) this.documentAddresses.delete(key);
 		}
+	}
+
+	/** The scope of a document this storage has a record for, from its state or address caches. */
+	private cachedDocumentScope(id: DocumentId): ScopeColumns | undefined {
+		const state = this.documentStates.get(id);
+		if (state !== undefined) return scopeColumns(parseJson<DocumentRecord>(state.record).scope);
+		for (const record of this.documentAddresses.values()) {
+			const parsed = parseJson<DocumentRecord>(record);
+			if (parsed.id === id) return scopeColumns(parsed.scope);
+		}
+		return undefined;
 	}
 
 	private rememberSubmission(record: string): void {
