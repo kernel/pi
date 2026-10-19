@@ -127,15 +127,6 @@ async function createRoot(storage: Storage): Promise<Seq> {
 	return storage.commit([{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
 }
 
-async function lockHolder(session: string): Promise<number | undefined> {
-	const result = await pool.query<{ pid: number }>(
-		`SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objsubid = 1 AND granted
-			AND ((classid::bigint << 32) | objid::bigint) = hashtextextended($1, 0)`,
-		[`pi-durable:session:${schema}:${session}`],
-	);
-	return result.rows[0]?.pid;
-}
-
 describePostgres("PostgresStorage ownership", () => {
 	it("keeps Sessions in one schema independent", async () => {
 		const first = await openStorage();
@@ -147,32 +138,19 @@ describePostgres("PostgresStorage ownership", () => {
 		await expect(createRoot(second)).resolves.toBe(1);
 	});
 
-	it("rejects a second open of a Session until the first closes", async () => {
+	it("hands a Session to a later open and rejects the earlier owner's commits", async () => {
 		const session = randomUUID();
 		const first = await openStorage(session);
-		await expect(PostgresStorage.open(pool, { session, schema })).rejects.toThrow("is open in another process");
-		await first.close(context);
+		await createRoot(first);
 		const second = await openStorage(session);
-		await expect(createRoot(second)).resolves.toBe(1);
-	});
-
-	it("stops accepting work when the lock connection drops", async () => {
-		const session = randomUUID();
-		const storage = await openStorage(session);
-		const pid = await lockHolder(session);
-		expect(pid).toBeDefined();
-		await pool.query("SELECT pg_terminate_backend($1)", [pid]);
-		await expect
-			.poll(() =>
-				storage.mintId().then(
-					() => "open",
-					(error: Error) => error.message,
-				),
-			)
-			.toContain("lost ownership");
-		await expect(createRoot(storage)).rejects.toThrow("lost ownership");
-		const replacement = await openStorage(session);
-		await expect(createRoot(replacement)).resolves.toBe(1);
+		const entryId = await first.mintId<EntryId>();
+		await expect(
+			first.commit([{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }], context),
+		).rejects.toThrow("was opened by another process");
+		await expect(first.mintId()).rejects.toThrow("lost ownership");
+		await expect(
+			second.commit([{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }], context),
+		).resolves.toBe(2);
 	});
 
 	it("rejects commits after another process takes ownership", async () => {

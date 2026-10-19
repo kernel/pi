@@ -41,7 +41,7 @@ import type {
 	TaskRecord,
 } from "../../types.ts";
 import { nextCursor, type ScanStart, scanStart } from "../scan.ts";
-import type { PostgresPool, PostgresPoolClient, PostgresQueryable, PostgresValue } from "./database.ts";
+import type { PostgresPool, PostgresQueryable, PostgresValue } from "./database.ts";
 import { applyPostgresMigrations, DEFAULT_POSTGRES_SCHEMA, quoteIdentifier } from "./migrations.ts";
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
@@ -212,21 +212,16 @@ const writeId = (write: StorageWrite): Id<string> | undefined => {
 	}
 };
 
-const lockKey = (schema: string, session: string): string => `pi-durable:session:${schema}:${session}`;
-
 /**
  * Postgres implementation of the Pico storage contract.
  *
- * One process owns a Session at a time. `open()` takes a session-level advisory lock on a client it keeps checked out,
- * and writes a fresh owner token that every commit checks under a row lock. If the lock connection drops, the storage
- * stops accepting work; if another process has since opened the Session, a commit from this one is rejected.
+ * One process owns a Session at a time. `open()` writes a fresh owner token that every commit checks under a row
+ * lock, so a later open takes the Session over and a commit from the earlier owner is rejected, after which that
+ * storage stops accepting work. Nothing is held between operations: an open storage keeps no connection.
  */
 export class PostgresStorage implements Storage {
 	private readonly pool: PostgresPool;
-	private readonly lockClient: PostgresPoolClient;
-	private readonly onLockError: (error: Error) => void;
 	private readonly session: string;
-	private readonly lockKey: string;
 	private readonly owner: string;
 	private readonly tables: Tables;
 	private nextId: number;
@@ -260,15 +255,10 @@ export class PostgresStorage implements Storage {
 
 	private constructor(
 		pool: PostgresPool,
-		lockClient: PostgresPoolClient,
-		onLockError: (error: Error) => void,
-		options: { session: string; schema: string; lockKey: string; owner: string; nextId: number; nextSeq: number },
+		options: { session: string; schema: string; owner: string; nextId: number; nextSeq: number },
 	) {
 		this.pool = pool;
-		this.lockClient = lockClient;
-		this.onLockError = onLockError;
 		this.session = options.session;
-		this.lockKey = options.lockKey;
 		this.owner = options.owner;
 		this.nextId = options.nextId;
 		this.nextSeq = options.nextSeq;
@@ -286,68 +276,29 @@ export class PostgresStorage implements Storage {
 		};
 	}
 
-	/**
-	 * Migrate the schema, lock the Session, and take ownership of it. Rejects when another process holds the Session.
-	 */
+	/** Migrate the schema and take ownership of the Session, from any process that held it before. */
 	static async open(pool: PostgresPool, options: PostgresStorageOptions): Promise<PostgresStorage> {
 		if (options.session.length === 0) throw new TypeError("PostgresStorage requires a non-empty session");
 		const schema = options.schema ?? DEFAULT_POSTGRES_SCHEMA;
 		if (options.migrate !== false) await applyPostgresMigrations(pool, schema);
-
-		const lockClient = await pool.connect();
-		let storage: PostgresStorage | undefined;
-		let lockError: Error | undefined;
-		const onLockError = (error: Error) => {
-			lockError = error;
-			storage?.loseLock(error);
-		};
-		lockClient.on("error", onLockError);
-		const key = lockKey(schema, options.session);
-		let locked = false;
-		try {
-			const lock = await lockClient.query<{ readonly locked: boolean }>(
-				"SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS locked",
-				[key],
-			);
-			if (lock.rows[0]?.locked !== true) {
-				throw new Error(`Durable Postgres session ${options.session} is open in another process`);
-			}
-			locked = true;
-			const owner = globalThis.crypto.randomUUID();
-			const metadata = (
-				await lockClient.query<MetadataRow>(
-					`INSERT INTO ${quoteIdentifier(schema)}.sessions (session_id, next_id, next_seq, owner)
-						VALUES ($1, 2, 1, $2)
-						ON CONFLICT (session_id) DO UPDATE SET owner = excluded.owner
-						RETURNING next_id, next_seq`,
-					[options.session, owner],
-				)
-			).rows[0];
-			if (metadata === undefined) throw new Error("Durable Postgres session metadata is missing");
-			storage = new PostgresStorage(pool, lockClient, onLockError, {
-				session: options.session,
-				schema,
-				lockKey: key,
-				owner,
-				nextId: Number(metadata.next_id),
-				nextSeq: Number(metadata.next_seq),
-			});
-			if (lockError !== undefined) storage.loseLock(lockError);
-			return storage;
-		} catch (error) {
-			let discard = lockError;
-			if (locked && discard === undefined) {
-				try {
-					await lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [key]);
-				} catch (unlockError) {
-					// Preserve the open failure; discarding the client closes its connection, which releases the lock.
-					discard = unlockError as Error;
-				}
-			}
-			lockClient.off("error", onLockError);
-			lockClient.release(discard);
-			throw error;
-		}
+		const owner = globalThis.crypto.randomUUID();
+		const metadata = (
+			await pool.query<MetadataRow>(
+				`INSERT INTO ${quoteIdentifier(schema)}.sessions (session_id, next_id, next_seq, owner)
+					VALUES ($1, 2, 1, $2)
+					ON CONFLICT (session_id) DO UPDATE SET owner = excluded.owner
+					RETURNING next_id, next_seq`,
+				[options.session, owner],
+			)
+		).rows[0];
+		if (metadata === undefined) throw new Error("Durable Postgres session metadata is missing");
+		return new PostgresStorage(pool, {
+			session: options.session,
+			schema,
+			owner,
+			nextId: Number(metadata.next_id),
+			nextSeq: Number(metadata.next_seq),
+		});
 	}
 
 	commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
@@ -384,7 +335,7 @@ export class PostgresStorage implements Storage {
 		if (typeof code !== "string" || typeof message !== "string" || !(code in commitErrorCodes)) return error;
 		if (code === "DU002") {
 			const lost = new Error(message);
-			this.loseLock(lost);
+			this.loseOwnership(lost);
 			return lost;
 		}
 		return new Error(message);
@@ -1035,7 +986,7 @@ export class PostgresStorage implements Storage {
 		});
 	}
 
-	/** Wait for admitted operations, release the session lock, and return its client. The pool stays open. */
+	/** Wait for admitted operations. The pool stays open. */
 	close(_context: Context): Promise<void> {
 		if (this.closing === undefined) {
 			this.closed = true;
@@ -1050,23 +1001,9 @@ export class PostgresStorage implements Storage {
 				this.drained = resolve;
 			});
 		}
-		let failure = this.lost;
-		if (failure === undefined) {
-			try {
-				await this.lockClient.query("SELECT pg_advisory_unlock(hashtextextended($1, 0))", [this.lockKey]);
-			} catch (error) {
-				failure = error as Error;
-			}
-		}
-		this.lockClient.off("error", this.onLockError);
-		// Discarding a client whose unlock failed closes its connection, which releases the lock.
-		this.lockClient.release(failure);
 	}
 
-	/**
-	 * Run one storage operation. Close waits for admitted operations, so the session lock outlives every query and
-	 * commit that started while the storage was open.
-	 */
+	/** Run one storage operation. Close waits for admitted operations, so it resolves after every query and commit that started while the storage was open. */
 	private async admit<T>(operation: () => Promise<T>): Promise<T> {
 		this.assertOpen();
 		this.admitted++;
@@ -1077,7 +1014,7 @@ export class PostgresStorage implements Storage {
 		}
 	}
 
-	private loseLock(error: Error): void {
+	private loseOwnership(error: Error): void {
 		this.lost ??= error;
 	}
 
