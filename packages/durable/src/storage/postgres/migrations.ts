@@ -260,10 +260,59 @@ BEGIN
 END
 $fn$`;
 
+/**
+ * Stores a group of batches in one call. The session row is locked and its owner checked once; then `commit_batch`
+ * runs per batch in a subtransaction, so a refusal by one of the adapter's checks (DU003 to DU009) keeps the batches
+ * before it and ends the call with the refusal, while any other error, ownership included, raises and rolls back
+ * everything the call wrote.
+ */
+const COMMIT_BATCHES_FUNCTION = `CREATE OR REPLACE FUNCTION {schema}.commit_batches(
+	p_session TEXT, p_owner TEXT, p_seq BIGINT, p_next_id BIGINT, p_batches JSON
+) RETURNS JSON LANGUAGE plpgsql AS $fn$
+DECLARE
+	v_owner TEXT;
+	v_seq BIGINT;
+	v_batch JSON;
+	v_stored INTEGER := 0;
+	v_code TEXT;
+	v_message TEXT;
+BEGIN
+	SELECT owner, next_seq INTO v_owner, v_seq FROM {schema}.sessions WHERE session_id = p_session FOR UPDATE;
+	IF NOT FOUND THEN
+		RAISE EXCEPTION 'Durable Postgres session metadata is missing' USING ERRCODE = 'DU001';
+	END IF;
+	IF v_owner <> p_owner OR v_seq <> p_seq THEN
+		RAISE EXCEPTION 'Durable Postgres session % was opened by another process', p_session USING ERRCODE = 'DU002';
+	END IF;
+	FOR v_batch IN SELECT value FROM json_array_elements(p_batches) LOOP
+		BEGIN
+			PERFORM {schema}.commit_batch(p_session, p_owner, p_seq + v_stored, p_next_id, v_batch);
+		EXCEPTION
+			WHEN SQLSTATE 'DU003' OR SQLSTATE 'DU004' OR SQLSTATE 'DU005' OR SQLSTATE 'DU006'
+				OR SQLSTATE 'DU007' OR SQLSTATE 'DU008' OR SQLSTATE 'DU009' THEN
+				GET STACKED DIAGNOSTICS v_code = RETURNED_SQLSTATE, v_message = MESSAGE_TEXT;
+				RETURN json_build_object('stored', v_stored, 'code', v_code, 'message', v_message);
+		END;
+		v_stored := v_stored + 1;
+	END LOOP;
+	RETURN json_build_object('stored', v_stored);
+END
+$fn$`;
+
 /** Immutable, ordered schema history. Append new migrations after the initial schema ships. */
 export const POSTGRES_MIGRATIONS: readonly PostgresMigration[] = [
 	{ version: 1, statements: INITIAL_SCHEMA },
 	{ version: 2, statements: [COMMIT_FUNCTION] },
+	// Version 3 adds the `sleeping` task status and the grouped commit function.
+	{
+		version: 3,
+		statements: [
+			"ALTER TABLE {schema}.tasks DROP CONSTRAINT tasks_status_check",
+			`ALTER TABLE {schema}.tasks ADD CONSTRAINT tasks_status_check
+				CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal'))`,
+			COMMIT_BATCHES_FUNCTION,
+		],
+	},
 ];
 
 export const CURRENT_POSTGRES_SCHEMA_VERSION = POSTGRES_MIGRATIONS.at(-1)?.version ?? 0;

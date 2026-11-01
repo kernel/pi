@@ -20,10 +20,8 @@ export interface PostgresPoolClient extends PostgresQueryable {
 
 /**
  * The connection pool `PostgresStorage` runs on. A `pg.Pool` satisfies it structurally, so this package
- * never imports a driver. The pool belongs to the caller: closing the storage does not end it.
- *
- * The storage keeps one client checked out for its whole lifetime to hold the session lock, so the pool
- * needs at least two connections.
+ * never imports a driver. The pool belongs to the caller: closing the storage does not end it, and an open
+ * storage holds no connection between operations.
  */
 export interface PostgresPool extends PostgresQueryable {
 	connect(): Promise<PostgresPoolClient>;

@@ -1,16 +1,27 @@
 import { randomUUID } from "node:crypto";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
+import { commitWrites, registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { idFromNumber } from "../src/ids.ts";
+import type { PostgresPool } from "../src/storage/postgres/database.ts";
 import {
 	applyPostgresMigrations,
 	CURRENT_POSTGRES_SCHEMA_VERSION,
 	PostgresStorage,
 } from "../src/storage/postgres/index.ts";
-import type { ConversationId, EntryId, Id, Seq, Storage, StorageWrite } from "../src/types.ts";
+import type {
+	CommitResult,
+	ConversationId,
+	DocumentCreate,
+	DocumentId,
+	EntryId,
+	Id,
+	Seq,
+	Storage,
+	StorageWrite,
+} from "../src/types.ts";
 import { ROOT_CONVERSATION_ID } from "../src/types.ts";
 
 // Set to a database the tests may create and drop schemas in, e.g. postgres://postgres:pg@localhost:5432/postgres.
@@ -55,10 +66,14 @@ class ReopeningStorage implements Storage {
 		this.session = session;
 	}
 
-	async commit(writes: readonly StorageWrite[], commitContext: Context): Promise<Seq> {
-		if (this.closed) return this.current.commit(writes, commitContext);
+	async commit(
+		batches: readonly (readonly StorageWrite[])[],
+		receive: (index: number, seq: Seq) => void,
+		commitContext: Context,
+	): Promise<CommitResult> {
+		if (this.closed) return this.current.commit(batches, receive, commitContext);
 		try {
-			return await this.current.commit(writes, commitContext);
+			return await this.current.commit(batches, receive, commitContext);
 		} finally {
 			await this.current.close(context);
 			this.current = await PostgresStorage.open(pool, { session: this.session, schema });
@@ -124,7 +139,11 @@ registerStorageConformance({ describe: describePostgres, expect, it }, "Postgres
 });
 
 async function createRoot(storage: Storage): Promise<Seq> {
-	return storage.commit([{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
+	return commitWrites(storage, [{ type: "conversation", value: { id: ROOT_CONVERSATION_ID } }], context);
+}
+
+function message(id: EntryId): StorageWrite {
+	return { type: "entry", value: { id, conversationId: ROOT_CONVERSATION_ID, kind: "message" } };
 }
 
 describePostgres("PostgresStorage ownership", () => {
@@ -144,13 +163,9 @@ describePostgres("PostgresStorage ownership", () => {
 		await createRoot(first);
 		const second = await openStorage(session);
 		const entryId = await first.mintId<EntryId>();
-		await expect(
-			first.commit([{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }], context),
-		).rejects.toThrow("was opened by another process");
+		await expect(commitWrites(first, [message(entryId)], context)).rejects.toThrow("was opened by another process");
 		await expect(first.mintId()).rejects.toThrow("lost ownership");
-		await expect(
-			second.commit([{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }], context),
-		).resolves.toBe(2);
+		await expect(commitWrites(second, [message(entryId)], context)).resolves.toBe(2);
 	});
 
 	it("rejects commits after another process takes ownership", async () => {
@@ -159,12 +174,7 @@ describePostgres("PostgresStorage ownership", () => {
 		await createRoot(storage);
 		await pool.query(`UPDATE "${schema}".sessions SET owner = 'another-process' WHERE session_id = $1`, [session]);
 		const entryId = await storage.mintId<EntryId>();
-		await expect(
-			storage.commit(
-				[{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }],
-				context,
-			),
-		).rejects.toThrow("was opened by another process");
+		await expect(commitWrites(storage, [message(entryId)], context)).rejects.toThrow("was opened by another process");
 		await expect(storage.conversation(ROOT_CONVERSATION_ID, context)).rejects.toThrow("lost ownership");
 	});
 
@@ -173,21 +183,74 @@ describePostgres("PostgresStorage ownership", () => {
 		const first = await openStorage(session);
 		await createRoot(first);
 		const minted = await first.mintId<EntryId>();
-		await first.commit(
-			[{ type: "entry", value: { id: minted, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }],
-			context,
-		);
+		await commitWrites(first, [message(minted)], context);
 		await first.close(context);
 		const second = await openStorage(session);
 		expect(await second.mintId()).toBe(minted + 1);
 		await expect(createRoot(second)).rejects.toThrow("already belongs to conversation");
 		const entryId = await second.mintId<EntryId>();
-		await expect(
-			second.commit(
-				[{ type: "entry", value: { id: entryId, conversationId: ROOT_CONVERSATION_ID, kind: "message" } }],
-				context,
-			),
-		).resolves.toBe(3);
+		await expect(commitWrites(second, [message(entryId)], context)).resolves.toBe(3);
+	});
+});
+
+describePostgres("PostgresStorage round trips", () => {
+	it("stores a group of batches in one call, and a copy once the batches before it are durable", async () => {
+		let queries = 0;
+		const counting: PostgresPool = {
+			query: (text, values) => {
+				queries++;
+				return pool.query(text, values);
+			},
+			connect: () => pool.connect(),
+		};
+		const storage = await PostgresStorage.open(counting, { session: randomUUID(), schema, migrate: false });
+		openStorages.add(storage);
+		await createRoot(storage);
+		const ids = [await storage.mintId<EntryId>(), await storage.mintId<EntryId>(), await storage.mintId<EntryId>()];
+		const receipts: number[] = [];
+		queries = 0;
+		const grouped = await storage.commit(
+			ids.map((id) => [message(id)]),
+			(index) => receipts.push(index),
+			context,
+		);
+		expect(grouped).toEqual({ stored: 3 });
+		expect(receipts).toEqual([0, 1, 2]);
+		expect(queries).toBe(1);
+
+		const sourceId = await storage.mintId<DocumentId>();
+		const copyId = await storage.mintId<DocumentId>();
+		const childId = await storage.mintId<ConversationId>();
+		const record = (id: DocumentId, conversationId: ConversationId): DocumentCreate => ({
+			id,
+			kind: "trip",
+			scope: { kind: "conversation", conversationId },
+			history: "rewindable",
+			fork: "asOf",
+		});
+		queries = 0;
+		const copied = await storage.commit(
+			[
+				[
+					{
+						type: "document.create",
+						record: record(sourceId, ROOT_CONVERSATION_ID),
+						content: { kind: "base", version: 1, value: { n: 1 } },
+					},
+				],
+				[{ type: "document.change", id: sourceId, content: { kind: "delta", version: 1, ops: [["s", ["n"], 2]] } }],
+				[
+					{ type: "conversation", value: { id: childId } },
+					{ type: "document.copy", record: record(copyId, childId), source: { id: sourceId, at: "current" } },
+				],
+			],
+			() => {},
+			context,
+		);
+		expect(copied).toEqual({ stored: 3 });
+		// The two batches before the copy in one call, the copy's source read once they are durable, then the copy's call.
+		expect(queries).toBe(3);
+		expect((await storage.document(copyId, "current", context))?.value).toEqual({ n: 2 });
 	});
 });
 

@@ -1,6 +1,6 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
 import { apply, type Op } from "@earendil-works/chord/delta";
-/** Thrown when the Session was opened by another process; any error from `commit` fails the Session. */
+/** A refusal by one of the adapter's own checks while preparing a batch: the batches before it stand. */
 export class StorageRejected extends Error {
 	constructor(message: string, options?: ErrorOptions) {
 		super(message, options);
@@ -8,9 +8,18 @@ export class StorageRejected extends Error {
 	}
 }
 
+/** A database request failed while a batch was being prepared: an unknown outcome, never a refusal. */
+class PostgresUnavailable extends Error {
+	constructor(cause: unknown) {
+		super("Postgres request failed", { cause });
+		this.name = "PostgresUnavailable";
+	}
+}
+
 import { StorageRequestError } from "../../errors.ts";
 import { idFromNumber, seqFromNumber } from "../../ids.ts";
 import type {
+	CommitResult,
 	ConversationId,
 	ConversationQuery,
 	ConversationRecord,
@@ -52,6 +61,15 @@ type MetadataRow = { readonly next_id: string; readonly next_seq: string };
 /** A conversation's own entries over one contiguous id range ending at its newest entry, newest-last. */
 type EntryWindow = { ids: EntryId[]; complete: boolean };
 type DocumentState = { readonly record: string; readonly version: number; value: JsonObject; deltasSinceBase: number };
+/** One batch after the adapter's own checks, ready for the commit function. */
+type PreparedBatch = {
+	readonly writes: readonly StorageWrite[];
+	readonly actions: Map<DocumentId, DocumentAction>;
+	readonly documents: DocumentWrites;
+	readonly encoded: string;
+	readonly candidateNextId: number;
+};
+type CommitBatchesResult = { readonly stored: number; readonly code?: string; readonly message?: string };
 type DocumentWrites = {
 	readonly claims: DocumentId[];
 	readonly rows: unknown[];
@@ -66,7 +84,10 @@ type DocumentWrites = {
 	>;
 };
 
-/** SQLSTATEs the commit function raises, each for one adapter error. */
+/**
+ * SQLSTATEs the commit functions raise, each for one adapter error. DU001 and DU002 reject the call; `commit_batches`
+ * catches the others per batch and returns them as the refusal.
+ */
 const commitErrorCodes: Readonly<Record<string, true>> = {
 	DU001: true,
 	DU002: true,
@@ -263,7 +284,7 @@ export class PostgresStorage implements Storage {
 		this.nextId = options.nextId;
 		this.nextSeq = options.nextSeq;
 		const schema = quoteIdentifier(options.schema);
-		this.commitFunction = `${schema}.commit_batch`;
+		this.commitFunction = `${schema}.commit_batches`;
 		this.tables = {
 			sessions: `${schema}.sessions`,
 			recordIds: `${schema}.record_ids`,
@@ -301,31 +322,102 @@ export class PostgresStorage implements Storage {
 		});
 	}
 
-	commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
+	/**
+	 * Stores `batches` in as few round trips as their content allows. Batches are prepared here (the adapter's own
+	 * checks, document rows, encoding) and sent as one call of the commit function, which locks the session row,
+	 * checks that this storage still owns it at the sequence it expects, and stores each batch against the state the
+	 * earlier ones left, stopping at the first it refuses. Only a `document.copy` reads stored state while being
+	 * prepared, so a batch with one starts a new call once the batches before it are durable; every other group is one
+	 * round trip. A refusal here or in the function keeps the batches before it; any other error rejects the call.
+	 */
+	commit(
+		batches: readonly (readonly StorageWrite[])[],
+		receive: (index: number, seq: Seq) => void,
+		_context: Context,
+	): Promise<CommitResult> {
 		return this.admit(async () => {
-			const documentActions = this.prepareDocumentActions(writes);
-			const candidateNextId = this.candidateNextId(writes);
-			this.checkBatchIds(writes);
-			const seq = seqFromNumber(this.nextSeq);
-			const documentWrites = await this.prepareDocumentWrites(documentActions, seq);
-			// One round trip: the commit function locks the session row, checks that this storage still owns it
-			// at the sequence it expects, validates the batch against the stored state, and writes every table.
-			try {
-				await this.pool.query(`SELECT ${this.commitFunction}($1, $2, $3, $4, $5::json)`, [
-					this.session,
-					this.owner,
-					seq,
-					candidateNextId,
-					this.encodeBatch(writes, documentWrites),
-				]);
-			} catch (error) {
-				throw this.commitError(error);
+			const stored: Seq[] = [];
+			const deliver = (): void => {
+				for (const [index, seq] of stored.entries()) receive(index, seq);
+			};
+			let index = 0;
+			while (index < batches.length) {
+				const chunk: PreparedBatch[] = [];
+				let refused: { readonly error: unknown } | undefined;
+				let candidateNextId = this.nextId;
+				while (index < batches.length) {
+					const writes = batches[index]!;
+					if (chunk.length > 0 && writes.some((write) => write.type === "document.copy")) break;
+					let prepared: PreparedBatch;
+					try {
+						prepared = await this.prepareBatch(writes, seqFromNumber(this.nextSeq + chunk.length));
+					} catch (error) {
+						if (error instanceof PostgresUnavailable) {
+							deliver();
+							throw error.cause;
+						}
+						refused = { error };
+						break;
+					}
+					candidateNextId = Math.max(candidateNextId, prepared.candidateNextId);
+					chunk.push(prepared);
+					index++;
+				}
+				if (chunk.length > 0) {
+					let result: CommitBatchesResult;
+					try {
+						const row = (
+							await this.pool.query<{ readonly result: string }>(
+								`SELECT ${this.commitFunction}($1, $2, $3, $4, $5::json)::text AS result`,
+								[
+									this.session,
+									this.owner,
+									this.nextSeq,
+									candidateNextId,
+									`[${chunk.map((batch) => batch.encoded).join(",")}]`,
+								],
+							)
+						).rows[0];
+						if (row === undefined) throw new Error("Durable Postgres commit returned no result");
+						result = JSON.parse(row.result) as CommitBatchesResult;
+					} catch (error) {
+						deliver();
+						throw this.commitError(error);
+					}
+					this.nextId = Math.max(this.nextId, candidateNextId);
+					for (const batch of chunk.slice(0, result.stored)) {
+						const seq = seqFromNumber(this.nextSeq);
+						this.nextSeq = seq + 1;
+						this.absorb(batch.writes, batch.actions, batch.documents, seq);
+						stored.push(seq);
+					}
+					if (result.code !== undefined) {
+						deliver();
+						return { stored: stored.length, refused: new Error(result.message) };
+					}
+				}
+				if (refused !== undefined) {
+					deliver();
+					return { stored: stored.length, refused: refused.error };
+				}
 			}
-			this.nextSeq = seq + 1;
-			this.nextId = Math.max(this.nextId, candidateNextId);
-			this.absorb(writes, documentActions, documentWrites, seq);
-			return seq;
+			deliver();
+			return { stored: stored.length };
 		});
+	}
+
+	/** Runs the adapter's own checks on one batch and encodes it. Throws the refusal, or `PostgresUnavailable`. */
+	private async prepareBatch(writes: readonly StorageWrite[], seq: Seq): Promise<PreparedBatch> {
+		const actions = this.prepareDocumentActions(writes);
+		this.checkBatchIds(writes);
+		const documents = await this.prepareDocumentWrites(actions, seq);
+		return {
+			writes,
+			actions,
+			documents,
+			encoded: this.encodeBatch(writes, documents),
+			candidateNextId: this.candidateNextId(writes),
+		};
 	}
 
 	/** Maps an error raised by the commit function to the adapter's own errors; other errors pass through. */
@@ -1039,20 +1131,23 @@ export class PostgresStorage implements Storage {
 		return record;
 	}
 
-	/** One statement reads the record and the revisions from the newest base at or before `at`. */
-	private async materializeDocument(id: DocumentId, at: DocumentPoint): Promise<StoredDocument | undefined> {
+	/**
+	 * Reads and materializes one document at `at` from one statement. With `preparing`, a failed database request is wrapped as
+	 * `PostgresUnavailable`, so a commit tells it apart from a refusal.
+	 */
+	private async materializeDocument(
+		id: DocumentId,
+		at: DocumentPoint,
+		preparing = false,
+	): Promise<StoredDocument | undefined> {
 		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
-		const row = (
-			await this.pool.query<{ readonly record: string | null; readonly revisions: string | null }>(
-				`SELECT (SELECT x.record::text FROM ${this.tables.documents} x WHERE x.session_id = $1 AND x.id = $2) AS record,
-					(SELECT json_agg(json_build_object('seq', r.seq, 'kind', r.kind, 'version', r.version, 'content', r.content)
-						ORDER BY r.seq)::text
-					 FROM ${this.tables.revisions} r WHERE r.session_id = $1 AND r.document_id = $2 AND r.seq <= $3
-						AND r.seq >= (SELECT b.seq FROM ${this.tables.revisions} b WHERE b.session_id = $1 AND b.document_id = $2
-							AND b.kind = 'base' AND b.seq <= $3 ORDER BY b.seq DESC LIMIT 1)) AS revisions`,
-				[this.session, id, upper],
-			)
-		).rows[0];
+		let row: { readonly record: string | null; readonly revisions: string | null } | undefined;
+		try {
+			row = (await this.queryDocumentRevisions(id, upper)).rows[0];
+		} catch (error) {
+			if (preparing) throw new PostgresUnavailable(error);
+			throw error;
+		}
 		if (row?.record === null || row?.record === undefined) return undefined;
 		const record = parseJson<DocumentRecord>(row.record);
 		if (at !== "current" && isCurrentOnly(record)) {
@@ -1081,6 +1176,19 @@ export class PostgresStorage implements Storage {
 			value = apply(value, revision.content as unknown as readonly Op[]) as JsonObject;
 		}
 		return { record, version: base.version, value, deltasSinceBase: tail.length };
+	}
+
+	/** The document's record and the revisions from its newest base at or before `upper` through `upper`. */
+	private queryDocumentRevisions(id: DocumentId, upper: number) {
+		return this.pool.query<{ readonly record: string | null; readonly revisions: string | null }>(
+			`SELECT (SELECT x.record::text FROM ${this.tables.documents} x WHERE x.session_id = $1 AND x.id = $2) AS record,
+					(SELECT json_agg(json_build_object('seq', r.seq, 'kind', r.kind, 'version', r.version, 'content', r.content)
+						ORDER BY r.seq)::text
+					 FROM ${this.tables.revisions} r WHERE r.session_id = $1 AND r.document_id = $2 AND r.seq <= $3
+						AND r.seq >= (SELECT b.seq FROM ${this.tables.revisions} b WHERE b.session_id = $1 AND b.document_id = $2
+							AND b.kind = 'base' AND b.seq <= $3 ORDER BY b.seq DESC LIMIT 1)) AS revisions`,
+			[this.session, id, upper],
+		);
 	}
 
 	private candidateNextId(writes: readonly StorageWrite[]): number {
@@ -1174,7 +1282,7 @@ export class PostgresStorage implements Storage {
 			let content = action.content;
 			if (action.copy !== undefined) {
 				try {
-					const stored = await this.materializeDocument(action.copy.id, action.copy.at);
+					const stored = await this.materializeDocument(action.copy.id, action.copy.at, true);
 					if (stored === undefined) throw new Error(`Fork source document ${action.copy.id} cannot be read`);
 					const create = action.create!;
 					if (
@@ -1189,7 +1297,7 @@ export class PostgresStorage implements Storage {
 					}
 					content = { kind: "base", version: stored.version, value: stored.value };
 				} catch (error) {
-					if (error instanceof StorageRejected) throw error;
+					if (error instanceof StorageRejected || error instanceof PostgresUnavailable) throw error;
 					throw new StorageRejected(`Document copy ${id} was rejected`, { cause: error });
 				}
 			}
