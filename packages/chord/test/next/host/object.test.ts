@@ -1298,6 +1298,7 @@ describe("reload: fates (slice 7b §4)", () => {
 		const report = await host.reload([], context);
 		expect(report).toEqual({
 			plugins: { added: [], changed: [], removed: ["@test/app"] },
+			failed: [],
 			objects: [{ object: "app.pure", kind: "ended" }],
 		});
 		expect(pure.state.value).toMatchObject({
@@ -1661,7 +1662,7 @@ describe("reload: GC", () => {
 		const objects = instancesOf(ChordObject, "remove");
 		const host = createHost({ onError: () => {} });
 		/** Loads the plugin; only the host keeps its facet. */
-		const load = (): [WeakRef<object>, Promise<void>] => {
+		const load = (): [WeakRef<object>, Promise<unknown>] => {
 			const made = defineFacet((h, self) => {
 				servePure(h, "v1", 1);
 				h.serve(Names, { compose: (table) => table.map(({ value }) => value) });

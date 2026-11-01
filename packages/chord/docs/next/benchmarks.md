@@ -880,3 +880,80 @@ the gap follows the shape of the text decoder's `fromFields`, not what runs: the
 (19.0-19.2 µs), the one change in it that matters is the never-executed `T` (retry) case, and writing that case with an
 object spread again (`...(f.length >= 2 ? { hops } : …)`) restores HEAD's 19.1 µs while other edits of the same size do
 not. With text measured first the gap is 22.4-22.5 → 23.0-23.3 µs (+2-3%). V8 code generation, recorded as noise.
+
+## Slice 7c: plugins (2026-10-30)
+
+**The plugins component** (`test/next/bench/plugins.ts`, new): 20 plugins, one worker facet each (a store object over a
+document, a derive, a method, a helper module and a copied contract; 80.9 KiB of scripts in all), Node 24.4.1. Medians
+of seven runs; three runs pinned to CPU 8, one unpinned:
+
+| Measurement | CPU 8 | unpinned (32 CPUs) |
+| --- | --- | --- |
+| cold build of the 20 worker facets (one esbuild build each, all at once) | 240.1-240.7 ms | 26.4 ms |
+| rebuild of one facet after an edit | 13.1-13.3 ms | 11.0 ms |
+| evaluation of one facet (`vm.Script`, its source map registered) | 0.16-0.27 ms | 0.09 ms |
+| reload of one plugin on a host (evaluation and `host.reload`, a pure swap) | 0.44-0.45 ms | 0.44 ms |
+| heap after 100 reloads of one plugin, against after a warm-up | +230-235 KiB | +229 KiB |
+
+The heap does not grow per reload: 2,000, 4,000 and 8,000 reloads leave +897, +1,186 and +1,432 KiB (sublinear); the
+same evaluations through plain `vm.Script` with V8's compilation cache off leave +420 KiB at 8,000 against +465 KiB
+through `evaluateFacet` (V8's own per-script bookkeeping), and the kernel's reloads alone wander between +200 and
++600 KiB at any count. Old facets and their closures are collected (the GC test: 200 reloads, every facet but the last
+two collected, the heap within 2 MiB of the warm-up).
+
+Fix round 1 (inline source maps without `sourcesContent`: positions only), CPU 8: the 20 scripts take 53.4 KiB (80.9
+KiB before); cold build 241.1 ms, rebuild 13.0 ms, evaluation 0.14 ms per facet, a reload 0.39 ms, heap after 100
+reloads +238 KiB.
+
+**Kernel hot paths** (per plugin at load and reload changes only staging), HEAD `18a155e2f` → build at paths of equal
+length, CPU 6, three alternating runs. `calls.ts`: local call 2.69-2.71 → 2.71-2.75 µs (6,660 B both), watched
+derive commit 10.34-10.36 → 10.43-10.49 µs (14,899 → 14,901 B), activation churn 58.93-59.58 → 59.44-59.73 µs
+(41,452-41,470 → 41,470 B). `links.ts` binary commit to frame (median / p90): append 0.035-0.036 / 0.058-0.059 →
+0.034-0.036 / 0.058-0.060 ms, changed field 0.027-0.028 / 0.031-0.033 → 0.027-0.028 / 0.031-0.033 ms, removal 0.022 /
+0.026-0.028 → 0.022 / 0.026-0.027 ms; with the young generation pinned alike within 2 µs; text alike; small call
+0.026-0.030 → 0.028-0.033 ms (pinned 0.030-0.035 → 0.030-0.032 ms); retained per hold equal (one binary hold 176.2 →
+170.1 KiB). `reload.ts`: swap of 50 / 1,000 objects 1.44-1.73 / 30.83-32.71 → 1.52-1.53 / 30.55-33.25 ms, restart
+1.01-1.05 / 15.54-16.87 → 0.95-0.99 / 15.90-16.02 ms until the reload resolves.
+
+## Slice 10: HTTP and workers (2026-10-31)
+
+`test/next/bench/http.ts` and `test/next/bench/workers.ts`, Node 24.4.1, CPU 6 (the forked workers inherit the pin).
+
+| Measurement | Result |
+| --- | --- |
+| keep-alive round trip, a JSON body: plain Node handler / a route (same process as the client) | build: 42.0-42.5 / 46.4-47.0 µs: +4.2-4.9 µs (9.9-11.7%); fix round 1: 42.5-42.9 / 62.8-64.4 µs: +20.3-21.5 µs |
+| the same after 30,000 warm-up requests (fix round 1) | 30.9-31.3 / 43.4-44.0 µs: +12.1-12.9 µs; with an authenticator reading `request.headers`: +15.9 µs |
+| the same, server and client in two processes (CPU 6 and 8; build) | 36.4-37.0 / 41.7-42.4 µs: +5 µs |
+| 100 MiB file: `pipeline` of a read stream / `fileResponse` | build (64 KiB reads): 602-618 / 487-565 MiB/s; fix round 1 (256 KiB, pulled): 477-751 / 560-611 MiB/s |
+| a worker's cold start with one shipped script: fork to `started` / to `ready` (median of 7) | 531-532 / 538-539 ms |
+| the server's heap per idle worker (20 workers, one reference each) | 49.5 KiB |
+
+A request's overhead was 16 µs at first: `host.root` cost about 7 µs of it per request (a linked abort signal, a
+`Promise.race` and an `awaitWithContext` per scope). Root scopes now take the caller's signal with one listener and
+settle one promise (`root.ts`; behaviour and tests unchanged): 4.2-4.9 µs, about the bar of 10% of a round trip. The
+rest is the request's scope (its abort controller, `CallContext`), admission and the response's header merge. The cold
+start is mostly Node's startup stripping the types of the source tree it imports; the start timer (60 s) is far from
+it.
+
+**Fix round 1** (the `fetch` core, the security baseline, Chord's listener as a native object). A route's overhead in
+the standard run grew from +4.5 µs to +20-21 µs (+41 µs before the Node fast path: the listener reads Node's parsed
+headers and makes a Web `Request` only when something reads `request.headers` or the body or a relay verifies; whole
+bodies are written as strings, in one write with the head). Warmed, +12-13 µs; a CPU profile of the warmed route path
+(per request, `test/next/bench/http.ts`'s route): the listener's request function 13.6 µs inclusive against the plain
+handler's 8.9 µs, of which writing the answer 8.3 µs (the plain handler's `writeHead` and `end`: 9.1 µs); `serve` 4.2
+µs (the root scope 2.1, the URL parse 0.9, default headers 0.6, admission and routing 1.1, the answer 0.7); the root
+scope's seal in a later microtask 0.9 µs. The baseline's extra headers cost 0.4 µs (a plain handler sending them).
+The rest, about 5 µs, sits in no function of the component: Node's tick and microtask machinery (33 µs inclusive
+against 18 µs for the plain handler). Opus's two trims are in (`lookup` decodes only segments with `%`; one abort
+controller per request: the Node side's own is gone). Kernel rows, HEAD `bc9a20f84` → fix round 1, CPU 6, alternating:
+binary 1 MiB call median 0.182-0.220 → 0.196 ms; reconnect of 1 / 100 references 1.02-1.10 / 79.1-80.3 → 1.04-1.05 /
+81.3-81.5 ms; watched `writable.set` 0.836-0.868 → 0.861-0.863 µs; watched derive commit 10.42-10.58 → 10.36-10.60 µs;
+activation churn 58.9-60.5 → 59.1-60.8 µs.
+
+**Kernel hot paths** (routes without a timer, `RouteHandle`, `Path` events, root scopes), HEAD `bc9a20f84` → build at
+paths of equal length, CPU 6, alternating runs. `calls.ts`: local call 2.70-2.83 → 2.70-2.83 µs (6,660 B both),
+watched derive commit 10.36-10.60 → 10.34-10.79 µs, activation churn 59.43-61.30 → 59.48-60.72 µs. `links.ts`: commit
+to frame and encode/decode alike; reconnect of 1 / 100 references 0.94-1.15 / 80.8-84.0 → 0.94-1.15 / 80.6-86.5 ms;
+1,000 parked calls 24.4-25.2 → 24.3-24.6 ms. `reload.ts`: swap of 50 / 1,000 objects 1.44-1.55 / 30.78-31.42 →
+1.32-1.56 / 31.20-31.83 ms, restart 0.96-0.98 / 15.75-16.34 → 0.95-1.10 / 15.91-15.94 ms until the reload resolves.
+`registries.ts` alike (one of 100 contributions set 1.47-2.45 → 1.48-3.41 µs, run to run).

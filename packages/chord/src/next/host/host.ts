@@ -55,8 +55,20 @@ import { type Presence, References } from "./presence.ts";
 import { Binding, type CheckedParams, type Held, type Reference, type Target } from "./reference.ts";
 import { RevocationKeys, type RevokedBy } from "./revocation.ts";
 import { type RootOptions, RootScopes } from "./root.ts";
-import { Route, type RouteOptions } from "./route.ts";
-import { type PluginFacet, recordFactory, type Staged, type StagingHost, stagePlugins } from "./staging.ts";
+import { Route, type RouteHandle, type RouteOptions } from "./route.ts";
+import {
+	addStaged,
+	emptyStaged,
+	type PluginFacet,
+	type Recorded,
+	type Request,
+	recordFactory,
+	type Staged,
+	type StagedPlugin,
+	type StagedRegistry,
+	type StagingHost,
+	stagePlugin,
+} from "./staging.ts";
 import { UnboundIndex, type UnboundRequest } from "./unbound.ts";
 import { uuidv7 } from "./uuid.ts";
 
@@ -201,22 +213,28 @@ export interface Host<P extends Principal = Principal, R extends JsonValue = Jso
 	 * registries composed once, the contributions); requests that waited for the publication are placed after that
 	 * batch. Then activates every served type with empty params and resolves when each has had its first outcome (the
 	 * start barrier, decision (a)): live, failed by its own cause, parked with no blocker here still without its first
-	 * outcome, or ended (failures go to `onError`). A setup that throws rejects it and closes the host. Runs once.
+	 * outcome, or ended (failures go to `onError`). A plugin whose setup throws or is refused at declaration (its name,
+	 * a type or registry another plugin serves, a remote type here without principal or address, `checkAccepts`) is
+	 * left out and reported (`failed`); it never closes the host. Runs once.
 	 */
-	load(facets: readonly PluginFacet<P>[], context: Context): Promise<void>;
+	load(facets: readonly PluginFacet<P>[], context: Context): Promise<LoadReport>;
 	/**
 	 * Reloads this host's plugins (slice 7b): `facets` is its complete new plugin set; a plugin in it and not loaded
 	 * is added, one loaded with another facet value is changed (the same facet object is unchanged: untouched), one
-	 * loaded and not in it is removed. Staging runs every setup and every affected object's new factory against a
-	 * recording `self`; any throw rejects it and nothing changed. Then it commits in one batch (types, registries,
+	 * loaded and not in it is removed. Staging runs every new setup and every affected object's new factory against a
+	 * recording `self`, per plugin: a plugin whose new code fails there keeps its old code (an added one is left out),
+	 * and so does a changed plugin whose recorded requests would not bind because of it (the closure rule); both are
+	 * reported (`failed`); `options.failed` names plugins the caller passes as their loaded facet because their new
+	 * code failed before (a build, an evaluation): the same for the closure rule and the report. Then it commits in one
+	 * batch (types, registries,
 	 * contributions; a publication waking the requests for the names it serves) and every object of a changed or
 	 * removed plugin takes its fate: swapped in place, restarted after its drain, retried, or ended (its type
 	 * removed). Resolves with the report once every fate started (swaps and retries checked their dependencies; it
 	 * does not wait for objects to go live). Reloads run one after another. Throws before `load` resolved; rejects
 	 * `released/closed` after `close`; `context`'s abort before the commit rejects `aborted` and changes nothing, after
-	 * it only ends the wait.
+	 * it only ends the wait (`aborted`, its `details.committed` naming what the commit applied: `CommittedReload`).
 	 */
-	reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport>;
+	reload(facets: readonly PluginFacet<P>[], context: Context, options?: ReloadOptions): Promise<ReloadReport>;
 	/**
 	 * A reference once its object is live (and hydrated). It acts as the host's principal and goes where its type's host
 	 * address puts it: here, over a route, or over the parent link (`Destination`). It waits while the reference is
@@ -245,15 +263,16 @@ export interface Host<P extends Principal = Principal, R extends JsonValue = Jso
 	connect(link: Link, options: LinkOptions<P>, context: Context): void;
 	/**
 	 * How this host reaches hosts of `Kind` (called before `load`, once per kind): `authorize` admits every hold routed
-	 * over it, `resolve` makes the link of an address. Holds for an address wait while it resolves and again after its
-	 * link drops (a backoff per address, 1 s doubling to 60 s), while they exist. `context` is the parent of the route's
-	 * work (its `resolve`s, the holds and calls on its links), aborted for it when this host closes.
+	 * over it, `resolve` makes the link of an address, for a new hold, on `retry`, or once after a link that completed
+	 * its handshake dropped while held (no timer). A rejected `resolve`, or a link closed before its handshake, fails the
+	 * address's holders `failed { waiting }` (they stay on its path). `context` is the parent of the route's work (its
+	 * `resolve`s, the holds and calls on its links), aborted for it when this host closes. Returns the address controls.
 	 */
 	route<N extends string, Q extends Params>(
 		Kind: HostKind<N, Q>,
 		options: RouteOptions<P, HostKind<N, Q>>,
 		context: Context,
-	): void;
+	): RouteHandle<HostKind<N, Q>>;
 	/**
 	 * Revokes `revocation` (§4, R10, R11), synchronously: every remote object whose principal it revokes (`revokedBy`)
 	 * ends at once, whatever references remain (holders get `forbidden`, running calls are aborted, an activation is
@@ -282,7 +301,7 @@ export interface Host<P extends Principal = Principal, R extends JsonValue = Jso
 	registry<C, V>(R: Registry<C, V>, context: Context, options?: GetOptions): Promise<RegistryValue<V>>;
 	/**
 	 * Runs `fn` with a call context for code outside objects (a Durable tool, a CLI): the host's principal (or
-	 * `options.principal`), this host's incarnation, `context`'s telemetry and signal, `ctx.get`. When `fn` settles or
+	 * `options.principal`; an explicit `undefined` runs anonymous), this host's incarnation, `context`'s telemetry and signal, `ctx.get`. When `fn` settles or
 	 * `context` aborts, the context is sealed: its signal aborted, `ctx.get` refused `released`, every reference it took
 	 * released; an abort rejects at once. `host.close` seals the open ones; after it, `root` rejects `released`.
 	 */
@@ -294,13 +313,38 @@ export interface Host<P extends Principal = Principal, R extends JsonValue = Jso
 	close(context: Context): Promise<void>;
 }
 
-/** What a reload did (slice 7b §1): its plugins by change, and what every affected object did. */
+/** A plugin left out at `load`, or whose new code failed at a reload (it kept its old code, if it had any), and why. */
+export type PluginFailure = { readonly plugin: string; readonly error: unknown };
+
+/**
+ * What a reload's commit applied, by plugin name: the `details.committed` of the `aborted` error of a reload whose
+ * context aborted after its commit (the commit stands; only the wait for the report ended).
+ */
+export type CommittedReload = {
+	readonly added: readonly string[];
+	readonly changed: readonly string[];
+	readonly removed: readonly string[];
+	/** The plugins whose new code failed: they kept their old code (an added one was left out). */
+	readonly failed: readonly string[];
+};
+
+/** What `host.reload` takes besides the plugin set: the plugins whose new code failed before it (a build, an evaluation). */
+export type ReloadOptions = { readonly failed?: readonly PluginFailure[] };
+
+/** What `load` did (decision "Per plugin at startup and reload"): the plugins it left out. */
+export type LoadReport = { readonly failed: readonly PluginFailure[] };
+
+/**
+ * What a reload did (slice 7b §1): its plugins by change (those applied), the plugins whose new code failed, and what
+ * every affected object did.
+ */
 export type ReloadReport = {
 	readonly plugins: {
 		readonly added: readonly string[];
 		readonly changed: readonly string[];
 		readonly removed: readonly string[];
 	};
+	readonly failed: readonly PluginFailure[];
 	/** Every live, activating, parked or failed object of a changed or removed plugin, by its label. */
 	readonly objects: readonly ReloadedObject[];
 };
@@ -326,22 +370,37 @@ export type Serving =
 	| { readonly kind: "object"; readonly object: ChordObject }
 	| { readonly kind: "waiting"; readonly cause: FailureCause };
 
-/** A published plugin: its facet (an unchanged reload passes the same object), its registries and contributions. */
+/**
+ * A published plugin: its facet (an unchanged reload passes the same object), what its setup staged (a reload that
+ * keeps it uses it again, its setup not run) and its contributions in the registries' tables.
+ */
 type LoadedPlugin<P extends Principal> = {
 	readonly facet: Facet<P>;
-	readonly registries: readonly string[];
+	readonly staged: StagedPlugin;
 	readonly contributions: readonly RegistryContribution[];
 };
 
-/** What a reload staged: the staged set, the plugins by change, and each affected object's fate. */
+/**
+ * What a reload staged: the staged set, the facets of the plugins it applies, the plugins by change, those that failed,
+ * and each affected object's fate.
+ */
 type ReloadPlan<P extends Principal> = {
 	readonly staged: Staged;
 	readonly facets: ReadonlyMap<string, Facet<P>>;
 	readonly added: readonly string[];
 	readonly changed: readonly string[];
 	readonly removed: readonly string[];
+	readonly failed: readonly PluginFailure[];
 	readonly fates: readonly PlannedFate[];
 };
+
+/** One staging pass of a reload: its plan, or the plugins it found failing (staging runs again without their new code). */
+type StagingPass<P extends Principal> =
+	| { readonly kind: "staged"; readonly plan: ReloadPlan<P>; readonly recorded: readonly RecordedFactory[] }
+	| { readonly kind: "failed"; readonly failed: ReadonlyMap<string, unknown> };
+
+/** A recorded new factory of an object staging planned a fate for: whose new code it is, and what it declared. */
+type RecordedFactory = { readonly plugin: string; readonly recorded: Recorded };
 
 /** An affected object's fate, as staging decided it. */
 type PlannedFate =
@@ -389,7 +448,7 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	/** The published plugins by name: their facet (an unchanged one is the same object), registries and contributions. */
 	readonly #plugins = new Map<string, LoadedPlugin<P>>();
 	/** The reloads, one after another (slice 7b §1): the last one's end, which the next one waits for. */
-	#reloading: Promise<unknown> = Promise.resolve();
+	#reloading: Promise<void> = Promise.resolve();
 	/** By identity, in the order they went live (the others where they were created). */
 	readonly #objects = new Map<string, ChordObject>();
 	/** Teardowns still running, by identity: the next instance of an identity waits for its previous ones. */
@@ -443,26 +502,31 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		this.store?.attach({ failed: (error) => this.#storageFailed(error), batch: this.batch });
 	}
 
-	async load(facets: readonly PluginFacet<P>[], context: Context): Promise<void> {
+	async load(facets: readonly PluginFacet<P>[], context: Context): Promise<LoadReport> {
 		this.batch.assertOutside("load");
 		this.#assertOpen();
 		if (this.#state !== "new") throw new Error("load runs once per host");
 		this.#state = "loading";
-		try {
-			const staged = stagePlugins(facets, this.#stagingHost());
-			this.#types = staged.types;
-			// The publication: the types and registries served, the facets' contributions and the first composition of
-			// every served registry, in one batch, before any object activates.
-			this.batch.commit(() => {
-				this.#publish(staged, staged.contributions.keys(), facetsByName(facets));
-				for (const record of this.#registries.values()) record.composeServed();
-			}, context);
-		} catch (error) {
-			// The host closes as `close` would: its links too. Nothing was activated, so no close can fail.
-			this.#closing ??= this.#close();
-			await this.#closing.catch(() => {});
-			throw error;
+		const staged = emptyStaged();
+		const loaded = new Map<string, Facet<P>>();
+		const failed: PluginFailure[] = [];
+		// A name given twice is refused the second time whether or not the first staged.
+		const given = new Set<string>();
+		// In the given order: of two plugins serving one name, the later is left out.
+		for (const plugin of facets) {
+			const twice = given.has(plugin.name);
+			given.add(plugin.name);
+			const error = twice ? loadedTwice(plugin.name) : this.#stageInto(staged, plugin);
+			if (error === undefined) loaded.set(plugin.name, plugin.facet);
+			else failed.push({ plugin: plugin.name, error });
 		}
+		this.#types = staged.types;
+		// The publication: the types and registries served, the facets' contributions and the first composition of
+		// every served registry, in one batch, before any object activates.
+		this.batch.commit(() => {
+			this.#publish(staged, loaded);
+			for (const record of this.#registries.values()) record.composeServed();
+		}, context);
 		// After the batch: what waited for the publication is placed (the gate lasted only for the setups).
 		this.#published = true;
 		this.#publication.resolve();
@@ -472,48 +536,133 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 			.map((served) => this.#object(served, EMPTY_PARAMS, undefined, context));
 		await Promise.all(objects.map(({ firstOutcome }) => firstOutcome));
 		if (this.#state === "loading") this.#state = "loaded";
+		return { failed };
 	}
 
-	reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport> {
+	/**
+	 * Whether a request for `Type` with `params` binds to `served` as a real bind checks it (`bind`): its kind, version
+	 * and fingerprint, and the provider's own host address; one whose `hostAddress` throws does not.
+	 */
+	#wouldBind(served: Served, Type: Contract, params: ParamsOf<Contract>): boolean {
+		if (unboundCause(served, Type.kind, Type.name, Type.version, Type.fingerprint) !== undefined) return false;
+		try {
+			return this.#misplaced(Type, served, params) === undefined;
+		} catch {
+			return false;
+		}
+	}
+
+	/** Whether a request for `Type` with `params` goes here; a `hostAddress` that throws: not here (it fails at bind). */
+	#placedHere(Type: Contract, params: ParamsOf<Contract>): boolean {
+		try {
+			return this.#destination.placedHere(Type, params);
+		} catch {
+			return false;
+		}
+	}
+
+	/** Stages `plugin`'s new code into `staged`: the error that refuses it (its setup, a declaration, a name served twice). */
+	#stageInto(staged: Staged, plugin: PluginFacet<P>): unknown {
+		try {
+			return addStaged(staged, stagePlugin(plugin, this.#stagingHost()));
+		} catch (error) {
+			return error;
+		}
+	}
+
+	reload(facets: readonly PluginFacet<P>[], context: Context, options: ReloadOptions = {}): Promise<ReloadReport> {
 		this.batch.assertOutside("reload");
 		if (this.#state === "closed") return Promise.reject(this.#closedError());
 		if (this.#state !== "loaded") throw new Error("reload runs after load");
-		const reload = this.#reloading.then(() => this.#reload(facets, context));
-		this.#reloading = reload.catch(() => {});
+		const reload = this.#reloading.then(() => this.#reload(facets, options.failed ?? [], context));
+		// The tail settles to nothing: a report kept as its value would keep a rejected facet's closure (its error).
+		this.#reloading = reload.then(
+			() => {},
+			() => {},
+		);
 		return reload;
 	}
 
 	/** One reload, after the previous one: staging, the commit, the fates, the report. */
-	async #reload(facets: readonly PluginFacet<P>[], context: Context): Promise<ReloadReport> {
+	async #reload(
+		facets: readonly PluginFacet<P>[],
+		before: readonly PluginFailure[],
+		context: Context,
+	): Promise<ReloadReport> {
 		this.#assertOpen();
 		if (context.abortSignal?.aborted) throw reloadAborted();
-		const plan = this.#stageReload(facets, context);
-		// Aborted while it staged (a setup may abort it synchronously): rejected as a staging error, nothing changed.
+		const plan = this.#stageReload(facets, before, context);
+		// Aborted while it staged (a setup may abort it synchronously): nothing changed.
 		if (context.abortSignal?.aborted) throw reloadAborted();
 		const started = this.#commit(plan, context);
-		const objects = await this.#report(started, context);
-		const { added, changed, removed } = plan;
-		return { plugins: { added, changed, removed }, objects };
+		const { added, changed, removed, failed } = plan;
+		const plugins = { added, changed, removed };
+		const committed: CommittedReload = { ...plugins, failed: failed.map(({ plugin }) => plugin) };
+		const objects = await this.#report(started, committed, context);
+		return { plugins, failed, objects };
 	}
 
 	/**
-	 * Staging (slice 7b §2), synchronous (no request or arriving hold meets it half done): every setup runs into a
-	 * staged table (`stagePlugins`), every object of a changed or removed plugin whose type is still served has its new
-	 * factory recorded, which decides its fate. A throw rejects the reload with nothing changed.
+	 * Staging (slice 7b §2), synchronous (no request or arriving hold meets it half done), per plugin (decision "Per
+	 * plugin at startup and reload"): a pass stages the new code (`#stagePass`); a plugin whose new code fails there
+	 * (or failed `before`, passed as its loaded facet) keeps its old code (an added one is left out) and staging runs
+	 * again without it; then a changed plugin whose recorded requests would not bind because of such a plugin keeps its
+	 * old code too (`#closure`), until nothing more fails. Bounded by the number of plugins with new code.
 	 */
-	#stageReload(facets: readonly PluginFacet<P>[], context: Context): ReloadPlan<P> {
-		const staged = stagePlugins(facets, this.#stagingHost());
-		const byName = facetsByName(facets);
-		const added: string[] = [];
-		const changed: string[] = [];
-		const removed = [...this.#plugins.keys()].filter((name) => !byName.has(name));
-		for (const [name, facet] of byName) {
-			const loaded = this.#plugins.get(name);
-			if (loaded === undefined) added.push(name);
-			else if (loaded.facet !== facet) changed.push(name);
+	#stageReload(facets: readonly PluginFacet<P>[], before: readonly PluginFailure[], context: Context): ReloadPlan<P> {
+		const failed = new Map(before.map(({ plugin, error }) => [plugin, error]));
+		const given = new Map<string, Facet<P>>();
+		// A name given twice: the second is refused, the first staged.
+		const twice: PluginFailure[] = [];
+		for (const { name, facet } of facets) {
+			if (given.has(name)) twice.push({ plugin: name, error: loadedTwice(name) });
+			else given.set(name, facet);
 		}
-		const reloaded = new Set([...changed, ...removed]);
+		for (;;) {
+			const pass = this.#stagePass(given, failed, context);
+			if (pass.kind === "failed") {
+				for (const [name, error] of pass.failed) failed.set(name, error);
+				continue;
+			}
+			const kept = this.#closure(pass.plan, pass.recorded, failed);
+			if (kept.size > 0) {
+				for (const [name, error] of kept) failed.set(name, error);
+				continue;
+			}
+			const failures = [...failed].map(([plugin, error]) => ({ plugin, error }));
+			return { ...pass.plan, failed: [...twice, ...failures] };
+		}
+	}
+
+	/**
+	 * One staging pass: the loaded entries of the plugins kept as they are (unchanged, or failed: their setups not run
+	 * again) first, then every other plugin's new code in the given order (one refused by a name the table has already
+	 * fails), then the new factory of every object of a changed or removed plugin whose type is still served (a throw
+	 * fails the plugin serving it). Its plan, or the plugins that failed.
+	 */
+	#stagePass(
+		given: ReadonlyMap<string, Facet<P>>,
+		failed: ReadonlyMap<string, unknown>,
+		context: Context,
+	): StagingPass<P> {
+		const staged = emptyStaged();
+		const failing = new Map<string, unknown>();
+		const fresh: PluginFacet<P>[] = [];
+		for (const [name, facet] of given) {
+			const loaded = this.#plugins.get(name);
+			if (loaded !== undefined && (loaded.facet === facet || failed.has(name))) addStaged(staged, loaded.staged);
+			else if (!failed.has(name)) fresh.push({ name, facet });
+		}
+		for (const plugin of fresh) {
+			const error = this.#stageInto(staged, plugin);
+			if (error !== undefined) failing.set(plugin.name, error);
+		}
+		if (failing.size > 0) return { kind: "failed", failed: failing };
+		const applied = new Set(fresh.map(({ name }) => name));
+		const removed = [...this.#plugins.keys()].filter((name) => !given.has(name));
+		const reloaded = new Set([...applied, ...removed]);
 		const fates: PlannedFate[] = [];
+		const recorded: RecordedFactory[] = [];
 		for (const object of this.#objects.values()) {
 			if (!reloaded.has(object.served.plugin)) continue;
 			const served = staged.types.get(object.served.contract.name);
@@ -521,9 +670,70 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 				fates.push({ kind: "end", object });
 				continue;
 			}
-			fates.push({ kind: object.reloadFate(recordFactory(object, served, context)), object, served });
+			try {
+				const declared = recordFactory(object, served, context);
+				recorded.push({ plugin: served.plugin, recorded: declared });
+				fates.push({ kind: object.reloadFate(declared), object, served });
+			} catch (error) {
+				if (!failing.has(served.plugin)) failing.set(served.plugin, error);
+			}
 		}
-		return { staged, facets: byName, added, changed, removed, fates };
+		if (failing.size > 0) return { kind: "failed", failed: failing };
+		const facets = new Map(fresh.map(({ name, facet }) => [name, facet]));
+		const added = fresh.filter(({ name }) => !this.#plugins.has(name)).map(({ name }) => name);
+		const changed = fresh.filter(({ name }) => this.#plugins.has(name)).map(({ name }) => name);
+		const plan = { staged, facets, added, changed, removed, failed: [], fates };
+		return { kind: "staged", plan, recorded };
+	}
+
+	/**
+	 * The closure rule: the changed plugins (new code applied) of `plan` with a recorded request that would not bind in
+	 * the staged table because of a plugin that failed in this reload: its name served there by such a plugin's old code,
+	 * or not served at all while some plugin failed (what a failed setup would have served is unknown). Requests to
+	 * another host are not checked (a rollout's rules). Each such plugin with the error it keeps its old code for.
+	 */
+	#closure(
+		plan: ReloadPlan<P>,
+		recorded: readonly RecordedFactory[],
+		failed: ReadonlyMap<string, unknown>,
+	): Map<string, unknown> {
+		const kept = new Map<string, unknown>();
+		if (failed.size === 0) return kept;
+		for (const { plugin, recorded: declared } of recorded) {
+			if (kept.has(plugin) || !plan.facets.has(plugin)) continue;
+			for (const request of declared.requests) {
+				const unbound = this.#unboundRequest(plan.staged, request, failed);
+				if (unbound === undefined) continue;
+				kept.set(plugin, new Error(`plugin "${plugin}": ${unbound}`));
+				break;
+			}
+		}
+		return kept;
+	}
+
+	/**
+	 * Why `request` (of a new factory) would not bind in `staged` because of a plugin in `failed`; `undefined`
+	 * when it binds, is placed on another host, or does not bind for another reason (it waits as any request does).
+	 */
+	#unboundRequest(staged: Staged, request: Request, failed: ReadonlyMap<string, unknown>): string | undefined {
+		const name = request.kind === "type" ? request.contract.name : request.registry.name;
+		const provider = request.kind === "type" ? staged.types.get(name)?.plugin : staged.registries.get(name)?.plugin;
+		if (provider !== undefined && !failed.has(provider)) return undefined;
+		if (request.kind === "type") {
+			const { contract, params } = request;
+			// A remote type the object reaches on another host: placed by the rollout's rules, not this host's.
+			if (!this.#placedHere(contract, params)) return undefined;
+			const served = staged.types.get(name);
+			if (served !== undefined && this.#wouldBind(served, contract, params)) return undefined;
+			return provider === undefined
+				? `needs ${name} v${contract.version}, which no plugin serves now (a plugin failed)`
+				: `needs ${name} v${contract.version}, which plugin "${provider}" serves on its old code`;
+		}
+		const served = staged.registries.get(name);
+		if (served !== undefined && registryServes(served, request.registry.version)) return undefined;
+		return provider === undefined
+			? `needs registry ${name} v${request.registry.version}, which no plugin serves now (a plugin failed)`
+			: `needs registry ${name} v${request.registry.version}, which plugin "${provider}" serves on its old code`;
 	}
 
 	/**
@@ -534,26 +744,25 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	 * requests waiting for the names the reload serves.
 	 */
 	#commit(plan: ReloadPlan<P>, context: Context): readonly StartedFate[] {
-		const { staged, added, changed, removed } = plan;
-		const published = new Set([...changed, ...added]);
-		const types = new Map<string, Served>();
-		// An unchanged plugin's types stay as they are: its objects are untouched.
-		for (const [name, served] of staged.types) {
-			types.set(name, published.has(served.plugin) ? served : this.#types.get(name)!);
-		}
+		const { staged, changed, removed } = plan;
+		const published = new Set(plan.facets.keys());
+		// A kept plugin's types are its loaded ones, as they are: its objects are untouched.
+		const types = staged.types;
 		this.batch.commit(() => {
 			for (const name of [...changed, ...removed]) {
 				const loaded = this.#plugins.get(name)!;
-				for (const registry of loaded.registries) {
+				for (const registry of loaded.staged.registries.keys()) {
 					if (staged.registries.get(registry)?.plugin !== name) this.registryRecord(registry).unserve();
 				}
 				for (const contribution of loaded.contributions) contribution.record.remove(contribution);
 				this.#plugins.delete(name);
 			}
 			this.#types = types;
-			this.#publish(staged, published, plan.facets);
+			this.#publish(staged, plan.facets);
 			for (const name of published) {
-				for (const registry of this.#plugins.get(name)!.registries) this.registryRecord(registry).composeServed();
+				for (const registry of staged.plugins.get(name)!.registries.keys()) {
+					this.registryRecord(registry).composeServed();
+				}
 			}
 		}, context);
 		for (const name of this.#references.keys()) if (!types.has(name)) this.#references.delete(name);
@@ -588,9 +797,14 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 
 	/**
 	 * The report, once every swap and retry had its first dependency check (a parked one reports why); restarts are
-	 * reported at once (their check follows the drain). `context`'s abort ends only this wait (`aborted`).
+	 * reported at once (their check follows the drain). `context`'s abort ends only this wait (`aborted`, its `details`
+	 * naming what the commit applied: `committed`).
 	 */
-	async #report(started: readonly StartedFate[], context: Context): Promise<ReloadedObject[]> {
+	async #report(
+		started: readonly StartedFate[],
+		committed: CommittedReload,
+		context: Context,
+	): Promise<ReloadedObject[]> {
 		const checks = started.map(async (fate): Promise<ReloadedObject> => {
 			if (fate.kind === "ended" || fate.kind === "restarted") return { object: fate.object, kind: fate.kind };
 			const cause = await fate.attempt.checked;
@@ -601,7 +815,11 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		try {
 			return await awaitWithContext(Promise.all(checks), context);
 		} catch {
-			throw reloadAborted();
+			const { added, changed, removed, failed } = committed;
+			const details = {
+				committed: { added: [...added], changed: [...changed], removed: [...removed], failed: [...failed] },
+			};
+			throw new ChordError({ code: "aborted", message: "reload: aborted after its commit", details });
 		}
 	}
 
@@ -645,7 +863,7 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		Kind: HostKind<N, Q>,
 		options: RouteOptions<P, HostKind<N, Q>>,
 		context: Context,
-	): void {
+	): RouteHandle<HostKind<N, Q>> {
 		this.#assertOpen();
 		if (this.#state !== "new") throw new Error("route: routes are declared before load");
 		if (this.#routes.has(Kind.kind)) throw new Error(`route: ${Kind.kind} is routed already`);
@@ -659,6 +877,10 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 			routing,
 		);
 		this.#routes.set(Kind.kind, route);
+		return {
+			retry: (address) => route.retry(address.key),
+			suspend: (address) => route.suspend(address.key),
+		};
 	}
 
 	revoke(revocation: R, context: Context): void {
@@ -741,8 +963,10 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	async root<T>(fn: (ctx: Ctx<P>) => Promise<T>, context: Context, options: RootOptions<P> = {}): Promise<T> {
 		this.batch.assertOutside("root");
 		this.#assertOpen();
-		// The scope's ctx acts as `principal`, a `P`.
-		return this.#roots.run(fn as (ctx: Ctx) => Promise<T>, options.principal ?? this.principal, context);
+		// The scope's ctx acts as `principal`, a `P`: an explicit `undefined` runs anonymous (an HTTP request nobody
+		// authenticated), only an omitted one takes the host's.
+		const principal = "principal" in options ? options.principal : this.principal;
+		return this.#roots.run(fn as (ctx: Ctx) => Promise<T>, principal, context);
 	}
 
 	/** The record of registry `name` on this host, made by its first use. */
@@ -881,6 +1105,14 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 			this.#wait(binding, Type.name, unbound, () => this.#place(binding, Type, params, context));
 			return undefined;
 		}
+		// An anonymous scope (an HTTP request nobody authenticated) is no principal a remote type's factory can serve
+		// (Opus's build review F5): refused, never bound as the host.
+		if (served!.kind !== "local" && principal === undefined) {
+			throw new ChordError({
+				code: "forbidden",
+				message: `${Type.name}: an anonymous caller gets no remote object`,
+			});
+		}
 		// Checked above: served here at the caller's version.
 		const object = this.#object(served!, params, principal, context, NO_CHAIN, binding.dependent);
 		binding.bind(object);
@@ -952,7 +1184,7 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		return this.#link(link, "route", options, context);
 	}
 
-	/** A link completed its handshake: a route's resets its address's backoff. */
+	/** A link completed its handshake: a route's address resolves again once if it drops. */
 	linkOpened(link: HostLink): void {
 		if (link.role !== "route") return;
 		for (const route of this.#routes.values()) route.opened(link);
@@ -1136,7 +1368,6 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 		const closed = this.#closedError();
 		// Code outside objects stops at its next use of Chord: an `fn` waiting in `sleep(ms, ctx)` ends.
 		this.#roots.close(closed);
-		for (const route of this.#routes.values()) route.close();
 		for (const holder of this.#pathHolders()) if (holder.kind === "remote") holder.lost(closed);
 		// At the fence too: requests still waiting for a publication or a provider end as the others did, and gets
 		// waiting for a publication that will not come fail now, not after the slow closes below (fix round 1).
@@ -1185,18 +1416,16 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 	}
 
 	/**
-	 * Publishes staged plugins `names` of `staged`, inside the publication's batch: their types served (`types`), the
-	 * registries they serve served (and composed once), their facet contributions entered into the tables.
+	 * Publishes the staged plugins of `facets` (by name), inside the publication's batch: the registries they serve
+	 * served, their facet contributions entered into the tables (the types are the staged table's, set by the caller).
 	 */
-	#publish(staged: Staged, names: Iterable<string>, facets: ReadonlyMap<string, Facet<P>>): void {
-		for (const name of names) {
-			const registries: string[] = [];
-			for (const [registry, { plugin, registry: token, provider }] of staged.registries) {
-				if (plugin !== name) continue;
+	#publish(staged: Staged, facets: ReadonlyMap<string, Facet<P>>): void {
+		for (const [name, facet] of facets) {
+			const plugin = staged.plugins.get(name)!;
+			for (const [registry, { registry: token, provider }] of plugin.registries) {
 				this.registryRecord(registry).serve(token.version, provider);
-				registries.push(registry);
 			}
-			const contributions = (staged.contributions.get(name) ?? []).map(({ registry, value }) =>
+			const contributions = plugin.contributions.map(({ registry, value }) =>
 				contributionOf(
 					this.registryRecord(registry.name),
 					{ plugin: name, type: undefined },
@@ -1205,7 +1434,7 @@ export class ChordHost<P extends Principal = Principal, R extends JsonValue = Js
 				),
 			);
 			for (const contribution of contributions) contribution.record.add(contribution);
-			this.#plugins.set(name, { facet: facets.get(name)!, registries, contributions });
+			this.#plugins.set(name, { facet, staged: plugin, contributions });
 		}
 	}
 
@@ -1264,12 +1493,18 @@ async function untilUsable(value: RegistryValueSource, usable: () => boolean, co
 /** What the report calls a fate. */
 const STARTED = { swap: "swapped", restart: "restarted", retry: "retried" } as const;
 
-/** The `aborted` error of a reload whose context aborted: before its commit nothing changed; after it, only its wait. */
+/** The `aborted` error of a reload whose context aborted before its commit: nothing changed. */
 function reloadAborted(): ChordError {
 	return new ChordError({ code: "aborted", message: "reload: aborted" });
 }
 
-/** The facets of a plugin set by plugin name. */
-function facetsByName<P extends Principal>(facets: readonly PluginFacet<P>[]): Map<string, Facet<P>> {
-	return new Map(facets.map(({ name, facet }) => [name, facet]));
+/** The error of a plugin name given twice: the second is refused. */
+function loadedTwice(name: string): Error {
+	return new Error(`plugin "${name}" is loaded twice`);
+}
+
+/** Whether registry provider `served` serves readers of `version`: its own, or an older one its `accepts` maps back. */
+function registryServes(served: StagedRegistry, version: number): boolean {
+	const provided = served.registry.version;
+	return provided === version || (provided > version && served.provider.accepts?.[version]?.value !== undefined);
 }

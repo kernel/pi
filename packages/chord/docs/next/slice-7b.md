@@ -45,7 +45,7 @@ type ReloadedObject = { readonly object: string } & (
   (decision 4: no install watchdog); its abort before the commit rejects `aborted` and changes nothing; after the commit
   it only ends the wait.
 
-## 2. Staging (all or nothing)
+## 2. Staging (all or nothing; **superseded** 2026-10-30 by "Per plugin at startup and reload": a failing plugin keeps its old code, slice 7c §4)
 
 1. **Setups.** Every facet's setup runs into a **staged** table, beside the live one: served types (with their factory,
    options and `bindProvider(contract, options.accepts)`, which runs `checkAccepts`), served registries (provider

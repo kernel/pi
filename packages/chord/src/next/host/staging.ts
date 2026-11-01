@@ -1,12 +1,14 @@
-// Staging (slice 7b §2): a plugin set's setups run into a staged table beside the live one (the types it serves with
-// their providers, the registries it serves, its facet contributions by plugin) with `load`'s checks; and an object's
-// new factory run against a recording `self`, which keeps what the factory declares (natives, documents, tables, jobs,
-// contributions, requests) and activates, binds and opens nothing, so a reload decides each object's fate before its
-// commit. `load` stages its facets the same way and publishes them.
+// Staging (slice 7b §2; per plugin, decision "Per plugin at startup and reload"): each plugin's setup runs into a table of
+// its own (the types it serves with their providers, the registries it serves, its facet contributions) with `load`'s
+// checks, merged into the staged table beside the live one, where a type or registry another plugin serves already
+// fails the plugin; and an object's new factory run against a recording `self`, which keeps what the factory declares
+// (natives, documents, tables, jobs, contributions, requests with their contract versions) and activates, binds and
+// opens nothing, so a reload decides each object's fate, and which plugins keep their old code, before its commit.
+// `load` stages its facets the same way and publishes them.
 
 import type { Context } from "../../context/index.ts";
 import type { Watchable } from "../../watch.ts";
-import type { Contract } from "../contracts/index.ts";
+import type { Contract, ParamsOf } from "../contracts/index.ts";
 import { contractData } from "../contracts/internal.ts";
 import type { Principal } from "../data/index.ts";
 import { bindProvider, checkParams } from "../data/internal.ts";
@@ -33,14 +35,22 @@ export type StagedRegistry = {
 	readonly provider: RegistryProvider<unknown, unknown>;
 };
 
-/** A plugin set's setups, run and checked: what it serves and contributes, nothing published yet. */
-export type Staged = {
+/** One plugin's setup, run and checked: what it serves and contributes, nothing published yet. */
+export type StagedPlugin = {
+	readonly name: string;
 	/** The served types by name, each with its plugin, factory, provider (its `accepts` checked) and `linger`. */
-	readonly types: Map<string, Served>;
+	readonly types: ReadonlyMap<string, Served>;
 	/** The served registries by name. */
+	readonly registries: ReadonlyMap<string, StagedRegistry>;
+	/** The facet contributions, in the setup's order. */
+	readonly contributions: readonly FacetContribution[];
+};
+
+/** A plugin set's staged plugins, merged: what they serve, by name, and each plugin's own table. */
+export type Staged = {
+	readonly types: Map<string, Served>;
 	readonly registries: Map<string, StagedRegistry>;
-	/** The facet contributions by plugin, in each setup's order. */
-	readonly contributions: Map<string, readonly FacetContribution[]>;
+	readonly plugins: Map<string, StagedPlugin>;
 };
 
 /** What staging needs of its host: whom it acts as, where it lives, and its presence lists for setups. */
@@ -53,42 +63,75 @@ export type StagingHost = {
 /** An npm package name, scoped or not. */
 const PLUGIN_NAME = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/;
 
-/**
- * Runs every facet's setup and checks what they declared: plugin names (npm names, each once), a type or registry
- * served twice, a remote type on a host without a principal or address, every provider's `accepts` (`checkAccepts`)
- * and every registry provider's shape. Throws the first error (naming its plugin where the check does not).
- */
-export function stagePlugins<P extends Principal>(facets: readonly PluginFacet<P>[], host: StagingHost): Staged {
-	const staged: Staged = { types: new Map(), registries: new Map(), contributions: new Map() };
-	for (const { name, facet } of facets) {
-		if (!PLUGIN_NAME.test(name)) throw new Error(`"${name}" is not a valid plugin name`);
-		if (staged.contributions.has(name)) throw new Error(`plugin "${name}" is loaded twice`);
-		// The host's presence lists are typed for its `P`.
-		const references = host.references as <C extends Contract>(Type: C) => Watchable<readonly Presence<C, P>[]>;
-		let setup: ReturnType<typeof setUp<P>>;
-		try {
-			setup = setUp(name, facet, references);
-		} catch (error) {
-			throw named(error, `plugin "${name}"`);
-		}
-		const { served, contributions } = setup;
-		for (const entry of served) stageEntry(name, entry, staged, host);
-		staged.contributions.set(name, contributions);
-	}
-	return staged;
+/** Whether `name` is a valid plugin name: an npm package name, scoped or not (the plugins component checks it too). */
+export function isPluginName(name: string): boolean {
+	return PLUGIN_NAME.test(name);
 }
 
-/** Stages one served entry of `plugin`: a registry's provider, or a type as `Served`. */
-function stageEntry(plugin: string, entry: ServedEntry, staged: Staged, host: StagingHost): void {
+/** A staged table with nothing in it. */
+export function emptyStaged(): Staged {
+	return { types: new Map(), registries: new Map(), plugins: new Map() };
+}
+
+/**
+ * Runs one plugin's setup and checks what it declared: its name (an npm name), a type or registry it serves twice, a
+ * remote type on a host without a principal or address, every provider's `accepts` (`checkAccepts`) and every registry
+ * provider's shape. Throws the first error, naming the plugin.
+ */
+export function stagePlugin<P extends Principal>({ name, facet }: PluginFacet<P>, host: StagingHost): StagedPlugin {
+	if (!isPluginName(name)) throw new Error(`"${name}" is not a valid plugin name`);
+	// The host's presence lists are typed for its `P`.
+	const references = host.references as <C extends Contract>(Type: C) => Watchable<readonly Presence<C, P>[]>;
+	const types = new Map<string, Served>();
+	const registries = new Map<string, StagedRegistry>();
+	try {
+		const { served, contributions } = setUp(name, facet, references);
+		for (const entry of served) stageEntry(name, entry, types, registries, host);
+		return { name, types, registries, contributions };
+	} catch (error) {
+		throw named(error, `plugin "${name}"`);
+	}
+}
+
+/**
+ * Merges `plugin` into `staged`; a type or registry another plugin serves there already refuses it (its error
+ * returned, nothing merged).
+ */
+export function addStaged(staged: Staged, plugin: StagedPlugin): Error | undefined {
+	for (const name of plugin.types.keys()) {
+		const other = staged.types.get(name);
+		if (other !== undefined)
+			return new Error(`plugin "${plugin.name}": ${name} is served twice (plugin "${other.plugin}")`);
+	}
+	for (const name of plugin.registries.keys()) {
+		const other = staged.registries.get(name);
+		if (other !== undefined) {
+			return new Error(`plugin "${plugin.name}": registry ${name} is served twice (plugin "${other.plugin}")`);
+		}
+	}
+	for (const [name, served] of plugin.types) staged.types.set(name, served);
+	for (const [name, registry] of plugin.registries) staged.registries.set(name, registry);
+	staged.plugins.set(plugin.name, plugin);
+	return undefined;
+}
+
+/** Stages one served entry of `plugin` into its tables: a registry's provider, or a type as `Served`. */
+function stageEntry(
+	plugin: string,
+	entry: ServedEntry,
+	types: Map<string, Served>,
+	registries: Map<string, StagedRegistry>,
+	host: StagingHost,
+): void {
 	if (entry.kind === "registry") {
 		const { registry, provider } = entry;
-		if (staged.registries.has(registry.name)) throw new Error(`registry ${registry.name} is served twice`);
+		if (registries.has(registry.name)) throw new Error(`registry ${registry.name} is served twice`);
 		checkProvider(registry.name, provider);
-		staged.registries.set(registry.name, { plugin, registry, provider });
+		registries.set(registry.name, { plugin, registry, provider });
 		return;
 	}
 	const { contract, factory, options } = entry;
-	if (staged.types.has(contract.name)) throw new Error(`${contract.name} is served twice`);
+	if (types.has(contract.name)) throw new Error(`${contract.name} is served twice`);
 	// A client serves only local types (§3): a remote object is owned by a principal of the host serving it.
 	if (contract.kind === "remote" && host.principal === undefined) {
 		throw new Error(`${contract.name}: a host without a principal serves only local types`);
@@ -115,7 +158,7 @@ function stageEntry(plugin: string, entry: ServedEntry, staged: Staged, host: St
 					contract: contract as RemoteContract,
 					factory: factory as Extract<Served, { kind: "remote" }>["factory"],
 				};
-	staged.types.set(contract.name, served);
+	types.set(contract.name, served);
 }
 
 /** What a recorded factory declared: what a reload's fate and checks need, nothing activated. */
@@ -126,9 +169,14 @@ export type Recorded = {
 	readonly tables: readonly TableDefinition[];
 	readonly jobs: readonly JobDefinition<unknown, unknown, unknown>[];
 	readonly contributions: readonly Registry<unknown, unknown>[];
-	/** Its requests: the types it gets (`self.get`) and the registries it reads (`self.registry`), by name. */
-	readonly requests: readonly string[];
+	/** Its requests: the types it gets (`self.get`, with their checked params) and the registries it reads (`self.registry`). */
+	readonly requests: readonly Request[];
 };
+
+/** A recorded request, with the contract version it was made at: a type and its params, or a registry. */
+export type Request =
+	| { readonly kind: "type"; readonly contract: Contract; readonly params: ParamsOf<Contract> }
+	| { readonly kind: "registry"; readonly registry: Registry<unknown, unknown> };
 
 /**
  * Runs `served`'s factory for `object` (its params and principal) against a recording `self` and returns what it
@@ -180,7 +228,7 @@ class RecordingSelf {
 	readonly #tables = new Map<string, TableDefinition>();
 	readonly #jobs = new Map<string, JobDefinition<unknown, unknown, unknown>>();
 	readonly #contributions = new Map<string, Registry<unknown, unknown>>();
-	readonly #requests: string[] = [];
+	readonly #requests: Request[] = [];
 
 	constructor(object: ChordObject, served: Served, context: Context) {
 		this.#object = object;
@@ -228,14 +276,14 @@ class RecordingSelf {
 
 	get(Type: Contract, params: unknown): never {
 		this.#assertDeclaring("get");
-		checkParams(Type, params, this.#context);
-		this.#requests.push(Type.name);
+		const checked = checkParams(Type, params, this.#context);
+		this.#requests.push({ kind: "type", contract: Type, params: checked.params });
 		return INERT;
 	}
 
 	registry(R: Registry<unknown, unknown>): RegistryValueSource {
 		this.#assertDeclaring("registry");
-		this.#requests.push(R.name);
+		this.#requests.push({ kind: "registry", registry: R });
 		// The host's own value (an attempt declares the same one): `retryOn` checks its kind.
 		return this.#object.host.registryRecord(R.name).value(R.version);
 	}

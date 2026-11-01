@@ -79,22 +79,46 @@ describe("load", () => {
 		await host.close(context);
 	});
 
-	it("refuses invalid and duplicate plugin names, double serves and a second load", async () => {
+	it("leaves out and reports invalid and duplicate plugin names and double serves (the later); refuses a second load", async () => {
 		const empty = defineFacet(() => {});
 		const info = defineFacet((host) => host.serve(Info, () => ({ title: constant("t") })));
-		await expect(createHost(noErrors).load([{ name: "Bad Name", facet: empty }], context)).rejects.toThrow(
-			'"Bad Name" is not a valid plugin name',
-		);
+		const loaded = async (facets: { readonly name: string; readonly facet: typeof empty }[]) => {
+			const host = createHost(noErrors);
+			const { failed } = await host.load(facets, context);
+			await host.close(context);
+			return failed.map(({ plugin, error }) => [plugin, (error as Error).message]);
+		};
+		expect(await loaded([{ name: "Bad Name", facet: empty }])).toEqual([
+			["Bad Name", '"Bad Name" is not a valid plugin name'],
+		]);
 		const twice = [
 			{ name: "a", facet: empty },
 			{ name: "a", facet: empty },
 		];
-		await expect(createHost(noErrors).load(twice, context)).rejects.toThrow('plugin "a" is loaded twice');
+		expect(await loaded(twice)).toEqual([["a", 'plugin "a" is loaded twice']]);
+		const throwing = defineFacet(() => {
+			throw new Error("first failed");
+		});
+		// The first one's setup failing does not make the second one's name free (Sol).
+		const failing = createHost(noErrors);
+		const report = await failing.load(
+			[
+				{ name: "a", facet: throwing },
+				{ name: "a", facet: info },
+			],
+			context,
+		);
+		expect(report.failed.map(({ plugin, error }) => [plugin, (error as Error).message])).toEqual([
+			["a", 'plugin "a": first failed'],
+			["a", 'plugin "a" is loaded twice'],
+		]);
+		expect(failing.hold(Info, {}, context).state.value).toMatchObject({ kind: "failed" });
+		await failing.close(context);
 		const served = [
 			{ name: "a", facet: info },
 			{ name: "b", facet: info },
 		];
-		await expect(createHost(noErrors).load(served, context)).rejects.toThrow("app.info is served twice");
+		expect(await loaded(served)).toEqual([["b", 'plugin "b": app.info is served twice (plugin "a")']]);
 		const host = createHost(noErrors);
 		await host.load([], context);
 		await expect(host.load([], context)).rejects.toThrow("load runs once per host");
@@ -807,14 +831,36 @@ forEachCodec(() => {
 			const { server } = await linked((h) => serveAll(h, factories));
 			expect((await server.get(Who, { id: 1 }, context)).who.value).toBe("server");
 			const client = createHost<P>({ onError: () => {} });
-			const loading = client.load([{ name: "@test/app", facet: defineFacet<P>((h) => serveAll(h, [])) }], context);
-			await expect(loading).rejects.toThrow("app.who: a host without a principal serves only local types");
+			const report = await client.load(
+				[{ name: "@test/app", facet: defineFacet<P>((h) => serveAll(h, [])) }],
+				context,
+			);
+			expect(report.failed).toEqual([
+				{
+					plugin: "@test/app",
+					error: expect.objectContaining({
+						message: 'plugin "@test/app": app.who: a host without a principal serves only local types',
+					}),
+				},
+			]);
+			await client.close(context);
 		});
 
 		it("a host without an address serves no remote type, whatever its principal", async () => {
 			const host = createHost<P>({ principal: { kind: "server" }, onError: () => {} });
-			const loading = host.load([{ name: "@test/app", facet: defineFacet<P>((h) => serveAll(h, [])) }], context);
-			await expect(loading).rejects.toThrow("app.who: a host without an address serves only local types");
+			const report = await host.load(
+				[{ name: "@test/app", facet: defineFacet<P>((h) => serveAll(h, [])) }],
+				context,
+			);
+			expect(report.failed).toEqual([
+				{
+					plugin: "@test/app",
+					error: expect.objectContaining({
+						message: 'plugin "@test/app": app.who: a host without an address serves only local types',
+					}),
+				},
+			]);
+			await host.close(context);
 		});
 
 		it("ctx.get acts as ctx.principal: a guest's call gets the guest's view; a local handler's acts as the host", async () => {
@@ -1004,8 +1050,8 @@ describe("the selected provider's own checks for a request made here (fix round 
 	});
 });
 
-describe("a load whose setup throws", () => {
-	it("closes the host as close does, links included, and rejects with the setup's error", async () => {
+describe('a load whose setup throws (decision "Per plugin at startup and reload")', () => {
+	it("leaves that plugin out and reports it; the others publish, the host and its links stay open", async () => {
 		const host = createHost<TestPrincipal>({ principal: { kind: "server" }, onError: () => {} });
 		const [a, b] = memoryLinkPair();
 		const [c, d] = memoryLinkPair();
@@ -1013,17 +1059,31 @@ describe("a load whose setup throws", () => {
 		host.connect(c, { principal: { kind: "server" }, codec: testCodec() }, context);
 		const child = new RawPeer(b);
 		const parent = new RawPeer(d);
-		const facet = defineFacet<TestPrincipal>(() => {
+		const broken = defineFacet<TestPrincipal>(() => {
 			throw new Error("setup threw");
 		});
-		await expect(host.load([{ name: "@test/app", facet }], context)).rejects.toThrow("setup threw");
+		const report = await host.load(
+			[
+				{ name: "@test/broken", facet: broken },
+				{
+					name: "@test/app",
+					facet: defineFacet<TestPrincipal>((h) => h.serve(Info, () => ({ title: constant("t") }))),
+				},
+			],
+			context,
+		);
+		expect(report.failed).toEqual([
+			{ plugin: "@test/broken", error: expect.objectContaining({ message: 'plugin "@test/broken": setup threw' }) },
+		]);
 		await transported();
-		expect([child.closed, parent.closed]).toEqual([true, true]);
-		expect(await rejection(host.get(Page, { id: 1 }, context))).toEqual({
-			code: "released",
-			reason: "closed",
-			message: "the host is closed",
+		expect([child.closed, parent.closed]).toEqual([false, false]);
+		expect((await host.get(Info, {}, context)).title.value).toBe("t");
+		// What the left-out plugin would have served waits as any missing type does.
+		expect(host.hold(Page, { id: 1 }, context).state.value).toMatchObject({
+			kind: "failed",
+			cause: { kind: "waiting" },
 		});
+		await host.close(context);
 	});
 });
 
@@ -1397,7 +1457,7 @@ describe("reload: the API (slice 7b §1)", () => {
 		await host.close(context);
 	});
 
-	it("an abort before the commit rejects aborted and changes nothing; after it, only ends the wait", async () => {
+	it("an abort before the commit rejects aborted and changes nothing", async () => {
 		const host = createHost(noErrors);
 		await host.load([{ name: "@app/info", facet: infoFacet("a") }], context);
 		const { context: aborted, cancel } = withCancel(context);
@@ -1409,31 +1469,74 @@ describe("reload: the API (slice 7b §1)", () => {
 		await host.close(context);
 	});
 
-	it("rejects with a setup's or a factory's throw, naming the plugin, and the host stays on its old code", async () => {
+	it("an abort after the commit rejects aborted naming what the commit applied, which stands", async () => {
+		const host = createHost(noErrors);
+		await host.load(
+			[
+				{ name: "@app/info", facet: infoFacet("a") },
+				{ name: "@app/gone", facet: defineFacet(() => {}) },
+			],
+			context,
+		);
+		const info = await host.get(Info, {}, context);
+		const { context: aborting, cancel } = withCancel(context);
+		// The abort lands right after the commit (its publication batch), while the reload waits for its report.
+		const { batch } = host as ChordHost;
+		const commit = batch.commit.bind(batch);
+		const hook = vi.spyOn(batch, "commit").mockImplementation((adopt, ctx) => {
+			commit(adopt, ctx);
+			if (ctx === aborting) cancel(new Error("stop"));
+		});
+		const reloading = host.reload(
+			[
+				{ name: "@app/info", facet: infoFacet("b") },
+				{ name: "@app/new", facet: defineFacet(() => {}) },
+			],
+			aborting,
+		);
+		const error = await rejection(reloading);
+		hook.mockRestore();
+		expect(error).toMatchObject({
+			code: "aborted",
+			details: { committed: { added: ["@app/new"], changed: ["@app/info"], removed: ["@app/gone"], failed: [] } },
+		});
+		expect(info.title.value).toBe("b");
+		await host.close(context);
+	});
+
+	it("reports a setup's or a factory's throw as failed, naming the plugin, which stays on its old code", async () => {
 		const host = createHost(noErrors);
 		await host.load([{ name: "@app/info", facet: infoFacet("a") }], context);
 		const info = await host.get(Info, {}, context);
 		const throwing = defineFacet(() => {
 			throw new Error("setup threw");
 		});
-		expect(await rejection(host.reload([{ name: "@app/info", facet: throwing }], context))).toMatchObject({
-			message: 'plugin "@app/info": setup threw',
-		});
+		const failedOf = async (facets: { readonly name: string; readonly facet: typeof throwing }[]) => {
+			const report = await host.reload(facets, context);
+			return report.failed.map(({ plugin, error }) => [plugin, (error as Error).message]);
+		};
+		expect(await failedOf([{ name: "@app/info", facet: throwing }])).toEqual([
+			["@app/info", 'plugin "@app/info": setup threw'],
+		]);
 		const factoryThrows = defineFacet((h) =>
 			h.serve(Info, () => {
 				throw new Error("factory threw");
 			}),
 		);
-		expect(await rejection(host.reload([{ name: "@app/info", facet: factoryThrows }], context))).toMatchObject({
-			message: 'plugin "@app/info", app.info: factory threw',
-		});
-		// A served-twice set and a broken accepts table are staging errors too.
+		expect(await failedOf([{ name: "@app/info", facet: factoryThrows }])).toEqual([
+			["@app/info", 'plugin "@app/info", app.info: factory threw'],
+		]);
+		// A type another plugin serves already fails the plugin with new code; an added one is left out.
 		const twice = [
 			{ name: "@app/info", facet: infoFacet("b") },
 			{ name: "@app/other", facet: infoFacet("c") },
 		];
-		expect(await rejection(host.reload(twice, context))).toMatchObject({ message: "app.info is served twice" });
-		expect(info.title.value).toBe("a");
+		const report = await host.reload(twice, context);
+		expect(report.plugins).toEqual({ added: [], changed: ["@app/info"], removed: [] });
+		expect(report.failed.map(({ plugin, error }) => [plugin, (error as Error).message])).toEqual([
+			["@app/other", 'plugin "@app/other": app.info is served twice (plugin "@app/info")'],
+		]);
+		expect(info.title.value).toBe("b");
 		expect(info.state.value).toEqual({ kind: "live" });
 		await host.close(context);
 	});

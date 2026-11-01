@@ -106,6 +106,9 @@ type ConversationHost<Tool extends ToolRegistration> = {
 /** Key of the Harness's internal index-size getter, for tests. */
 export const SCHEDULER_INDEX_SIZES = Symbol.for("pi-durable.schedulerIndexSizes");
 
+/** Key of the Harness's internal idle-state getter (kept contexts against a full recompute), for tests. */
+export const SCHEDULER_IDLE_STATE = Symbol.for("pi-durable.schedulerIdleState");
+
 class ConversationImpl<Tool extends ToolRegistration> implements Conversation {
 	readonly id: ConversationId;
 	readonly #host: ConversationHost<Tool>;
@@ -316,6 +319,11 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 	/** Internal, for tests: sizes of the scheduler's ownership indexes. */
 	get [SCHEDULER_INDEX_SIZES](): TaskScheduler["indexSizes"] {
 		return this.#tasks.indexSizes;
+	}
+
+	/** Internal, for tests: the kept contexts' idle state and its disagreements with a full recompute. */
+	get [SCHEDULER_IDLE_STATE](): TaskScheduler["idleState"] {
+		return this.#tasks.idleState;
 	}
 
 	inspect(context: Context): Promise<HarnessInspection> {

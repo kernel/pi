@@ -32,6 +32,11 @@ slice spec's section citations are for orientation, not a reading limit (owner, 
   (Durable's 35-37); benchmarks in `benchmarks.md`.
 - **Slice 7b** (built 2026-10-29, `slice-7b.md`): `host.reload`, staging (`host/staging.ts`), fates, adapted members
   (`host/adapted.ts`), references, jobs and registries across a reload; examples 33-34; `test/next/bench/reload.ts`.
+- **Slice 7c** (committed 2026-10-30, `slice-7c.md`): `src/next-node/plugins/` (discovery, builds, evaluation,
+  `pluginFile`, `mapStack`, `installDependencies`, the watcher, `rollout`), per-plugin `load` and `reload`; examples 35-39.
+- **Slice 10** (built 2026-10-31, `slice-10.md`): `src/next-node/http/` (a `fetch` core with the security baseline,
+  Chord's Node listener, `nodeRequest`, plugin sockets, links), `src/next-node/workers/`, `createPluginRuntime`, kinds,
+  the kernel's `RouteHandle` and anonymous `host.root`, origins only from relays; examples 40-48.
 - **Chord's shared code** (upstream pi): `src/watch.ts` (`Watch`, `NativeWatch`, `WatchHandle`, `WatchEnd`,
   `NativeWatchable`), Delta (`track`, `diffRevisions`, `applyImmutable`, encoders, `PendingOps`, `appendText`),
   context, JSON, output, SQLite drivers.
@@ -56,7 +61,7 @@ telemetry last, since it instruments the app kit too).
 | 8 | **Registries and `host.root`** | registries, `self.writable`, `retryOn`, Durable's `registryReader`, `host.root` (`chord(fn, context)` and the harness object are p3's base code) |
 | 7a | **The dependency model** | requests that outlive providers, parked attempts without timers, wakes, the publication gate, getters, registries as dependencies, `parked_long` (`slice-7a.md`, `dependencies/model.md`) |
 | 7b | **Reload in the kernel** | `host.reload`: staging, commit, rollback; swaps, restarts, removal and re-serving; holds and `accepts` across a reload; jobs and registries across a reload; per-name wakes (`slice-7b/` brief) |
-| 7c | **Loader and dev** | `chord/next/loader` (discovery, `buildFacet`, `evaluateFacet`, `pluginFile`, dependencies) and `chord/next/dev` (watcher, reload control across hosts) |
+| 7c | **Plugins** | `chord/next/plugins` (discovery, `buildFacet`, `evaluateFacet`, `pluginFile`, `installDependencies`, the watcher, `rollout`, `mapStack`; no dev/prod split; the kernel's `load`/`reload` per plugin; `slice-7c.md`) |
 | 10 | **HTTP and workers** | `chord/next/http` (server, `Http` registry, responses as descriptions, WebSocket entry) and `chord/next/workers` (a worker per address, IPC, idle stop) |
 | 11 | **Web and TUI** | `chord/next/web` (page host, React hooks) and `chord/next/tui` (launcher, sandbox), from p2's code |
 | 9 | **Telemetry** | spans, events, metrics across hosts |
@@ -139,7 +144,7 @@ pattern, no code. Decided cuts are noted where they apply.
 | 22 | message format, header schema, unknown ids, one message per commit per link, consumers apply ops, plugin errors | 3a |
 | 22 | relays, size limits per part, compression at the origin, adapted bindings get diffs | 4a (relays), 4b (limits, compression), 7b |
 | 22 | trace carriers (R5) | 9 |
-| 23 | HTTP, channels, chunked transfers | after slice 9 (with the first real proof) |
+| 23 | HTTP (routes, wraps, responses as descriptions, request bodies, plugin sockets), workers; channels and chunked transfers stay owner patterns until a second user | 10 |
 | 24 | Durable integration: `chord(fn, context)` (Q6), a `RegistryReader` over composed registries; the harness object and its model and env registries are p3's (base code, owner, 2026-10-27) | 8 (Chord parts), p3 |
 | 24 | `StoreStorage` | 6b |
 | 27 | versions table: contracts (L1 done), registries 8, documents 6, jobs 5, link protocol 3a | as listed |
@@ -165,20 +170,21 @@ deleted (the slice's spec and code are the record). Moved here from `carry-over.
   slice 3b.)
 - **The park deadline's per-type override** is not built: a parked call waits the reference's `readyTimeout`. Build
   it only if a real case needs it. (Slice 3b spec.)
-- Failed-check paths are TypeBox's instance paths (ambiguous for keys containing `/` or `~`); documented, not fixed.
-  (L1.)
 - No CBOR; revisit only if benchmarks show encoding as a bottleneck (slice 3a's and 4a's do not). (L2 decisions.)
 - **One N on every host:** a relay forwards calls at once, so a worker announcing a smaller N than the relay's could
   see more running calls of one origin than it accepts (a protocol error). Every host announces 256; per-link N, if
   ever needed, must bound the relay's forwarding too. (Slice 4a rework.)
 - **The Durable conversation view's size on re-hold** is a known cost until pi #11327 (windowed view) lands. (Slice 4.)
-- **`map(bytes())` is refused at declaration** ("unsupported keyword `~refine`"): TypeBox's `Record` copies the bytes
-  schema's check as an enumerable key, which the snapshot walk refuses. An L1 bug found in slice 3a, not fixed yet.
 
 ### Later: reload (when a case needs it)
 
 - **`rebuild` of tables** (key and column-type changes): `evolveTable` has no edit for them; build one only when a
   real case needs it. (Slice 6a's second spec review; out of slice 7b's scope, `slice-7b.md` §12.)
+
+### After slice 11
+
+- **Small examples** (owner, 2026-10-30: the 7c examples are complete but complex): once HTTP, workers, web and TUI
+  exist, a pass of small, easy-to-read examples, each showing one thing a plugin author or app does.
 
 ### Slice 9: telemetry
 
