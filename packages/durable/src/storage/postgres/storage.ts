@@ -291,6 +291,7 @@ export class PostgresStorage implements Storage {
 	private documentScans = new Map<string, string[]>();
 	private documentAddresses = new Map<string, string>();
 	private admitted = 0;
+	private commitEpoch = 0;
 	private drained: (() => void) | undefined;
 
 	private constructor(
@@ -536,7 +537,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	conversation(id: ConversationId, _context: Context): Promise<ConversationRecord | undefined> {
-		return this.admit(() => this.readConversation(id));
+		return this.readCached(() => this.readConversation(id));
 	}
 
 	scanConversations(
@@ -545,7 +546,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -574,7 +575,7 @@ export class PostgresStorage implements Storage {
 		idOrContext: EntryId | Context,
 		context?: Context,
 	): Promise<{ readonly entry: EntryRecord; readonly commitSeq: Seq } | undefined> {
-		return this.admit(() => this.readEntry(idOrConversationId, idOrContext, context));
+		return this.readCached(() => this.readEntry(idOrConversationId, idOrContext, context));
 	}
 
 	findLatestHeadMarker(
@@ -582,7 +583,7 @@ export class PostgresStorage implements Storage {
 		atOrBeforeEntryId: EntryId | undefined,
 		_context: Context,
 	): Promise<(EntryRecord & { readonly head: EntryId }) | undefined> {
-		return this.admit(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
+		return this.readCached(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
 	}
 
 	scanEntries(
@@ -591,7 +592,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
-		return this.admit(() => this.readEntries(query, limit, cursor));
+		return this.readCached(() => this.readEntries(query, limit, cursor));
 	}
 
 	private async readEntry(
@@ -818,6 +819,7 @@ export class PostgresStorage implements Storage {
 		documents: DocumentWrites,
 		seq: Seq,
 	): void {
+		this.commitEpoch++;
 		for (const write of writes) {
 			switch (write.type) {
 				case "conversation":
@@ -912,7 +914,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const cached = this.tasks.get(id);
 			if (cached !== undefined) return parseJson<StoredTask>(cached);
 			const [record] = await this.records(
@@ -932,7 +934,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -957,7 +959,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	submission(id: SubmissionId, _context: Context): Promise<SubmissionRecord | undefined> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const cached = this.submissions.get(id);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
 			const [record] = await this.records(
@@ -977,7 +979,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -1001,7 +1003,7 @@ export class PostgresStorage implements Storage {
 		requestId: string,
 		_context: Context,
 	): Promise<SubmissionRecord | undefined> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const key = requestKey(conversationId, requestId);
 			const cachedId = this.submissionsByRequest.get(key);
 			if (cachedId === null) return undefined;
@@ -1021,7 +1023,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	findDocument(address: DocumentAddress, at: DocumentPoint, _context: Context): Promise<DocumentRecord | undefined> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const key = at === "current" ? addressKey(address) : undefined;
 			if (key !== undefined) {
 				const cached = this.documentAddresses.get(key);
@@ -1053,7 +1055,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	document(id: DocumentId, at: DocumentPoint, _context: Context): Promise<StoredDocument | undefined> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			if (at === "current") {
 				const state = this.documentStates.get(id);
 				if (state !== undefined) {
@@ -1084,7 +1086,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
-		return this.admit(async () => {
+		return this.readCached(async () => {
 			const scope = scopeColumns(query.scope);
 			const after = cursorId(cursor) ?? -1;
 			const key = query.at === "current" ? `${scope.scopeKind}:${scope.ownerId}:${query.kind ?? ""}` : undefined;
@@ -1147,6 +1149,30 @@ export class PostgresStorage implements Storage {
 		}
 	}
 
+	private readCached<T>(operation: () => Promise<T>): Promise<T> {
+		return this.admit(async () => {
+			const epoch = this.commitEpoch;
+			try {
+				return await operation();
+			} finally {
+				if (epoch !== this.commitEpoch) {
+					// A commit can be absorbed while the codec awaits keys. Discard that
+					// read's stale cache writes; the next read reloads committed state.
+					this.conversations.clear();
+					this.tasks.clear();
+					this.submissions.clear();
+					this.submissionsByRequest.clear();
+					this.entries.clear();
+					this.entryWindows.clear();
+					this.headMarkers.clear();
+					this.documentStates.clear();
+					this.documentScans.clear();
+					this.documentAddresses.clear();
+				}
+			}
+		});
+	}
+
 	private loseOwnership(error: Error): void {
 		this.lost ??= error;
 	}
@@ -1175,11 +1201,21 @@ export class PostgresStorage implements Storage {
 
 	private async entryRows(sql: string, params: PostgresValue[]) {
 		const result = await this.pool.query<EntryJsonRow>(sql, params);
+		if (this.codec === undefined) {
+			for (const row of result.rows) this.assertRecord(row.record);
+			return result;
+		}
 		const rows: EntryJsonRow[] = [];
 		for (const row of result.rows) {
-			rows.push({ ...row, record: await this.decodeValue("entries", Number(row.id), row.record) });
+			const record = await this.decodeValue("entries", Number(row.id), row.record);
+			this.assertRecord(record);
+			rows.push({ ...row, record });
 		}
 		return { ...result, rows };
+	}
+
+	private assertRecord(json: string): void {
+		if (!json.trimStart().startsWith("{")) throw new Error("Stored record requires a compatible value codec");
 	}
 
 	private async records(
@@ -1190,7 +1226,12 @@ export class PostgresStorage implements Storage {
 	) {
 		const out: string[] = [];
 		for (const row of (await executor.query<JsonRow>(sql, params)).rows) {
-			out.push(table === undefined ? row.record : await this.decodeValue(table, Number(row.id), row.record));
+			const record =
+				table === undefined || this.codec === undefined
+					? row.record
+					: await this.decodeValue(table, Number(row.id), row.record);
+			this.assertRecord(record);
+			out.push(record);
 		}
 		return out;
 	}
@@ -1248,17 +1289,29 @@ export class PostgresStorage implements Storage {
 					>(row.revisions);
 		const base = revisions[0];
 		if (base === undefined || base.kind !== "base") throw new Error(`Document ${id} is missing a required base`);
-		let value = parseJson<JsonObject>(
-			await this.decodeValue("document_revisions", id, encodeJson(base.content), base.seq),
-		);
+		if (this.codec === undefined && typeof base.content === "string") {
+			throw new Error("Stored document requires a compatible value codec");
+		}
+		let value =
+			this.codec === undefined
+				? (base.content as JsonObject)
+				: parseJson<JsonObject>(
+						await this.decodeValue("document_revisions", id, encodeJson(base.content), base.seq),
+					);
 		const tail = revisions.slice(1);
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version) {
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
 			}
-			const ops = parseJson<readonly Op[]>(
-				await this.decodeValue("document_revisions", id, encodeJson(revision.content), revision.seq),
-			);
+			if (this.codec === undefined && typeof revision.content === "string") {
+				throw new Error("Stored document requires a compatible value codec");
+			}
+			const ops =
+				this.codec === undefined
+					? (revision.content as unknown as readonly Op[])
+					: parseJson<readonly Op[]>(
+							await this.decodeValue("document_revisions", id, encodeJson(revision.content), revision.seq),
+						);
 			value = apply(value, ops) as JsonObject;
 		}
 		return { record, version: base.version, value, deltasSinceBase: tail.length };

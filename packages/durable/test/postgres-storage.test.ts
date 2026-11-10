@@ -169,6 +169,54 @@ registerStorageConformance(
 );
 
 describePostgres("Postgres value codec", () => {
+	it("does not retain a stale entry window when a commit overlaps decoding", async () => {
+		const session = randomUUID();
+		const first = await openStorage(session, testCodec);
+		await createRoot(first);
+		const oldId = await first.mintId<EntryId>();
+		await commitWrites(first, [message(oldId)], context);
+		await first.close(context);
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let blocked = false;
+		const storage = await openStorage(session, {
+			...testCodec,
+			async decode(address, json) {
+				if (address.table === "entries" && !blocked) {
+					blocked = true;
+					enter();
+					await released;
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				}
+				return testCodec.decode(address, json);
+			},
+		});
+		const reading = storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		await entered;
+		const newId = await storage.mintId<EntryId>();
+		await commitWrites(storage, [message(newId)], context);
+		release();
+		await reading;
+		const after = await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		expect(after.items.map((entry) => entry.id)).toContain(newId);
+	});
+
+	it("rejects encoded records without a decoder", async () => {
+		const session = randomUUID();
+		const first = await openStorage(session, testCodec);
+		await createRoot(first);
+		const id = await first.mintId<EntryId>();
+		await commitWrites(first, [message(id)], context);
+		await first.close(context);
+		const plain = await openStorage(session);
+		await expect(plain.entry(id, context)).rejects.toThrow("compatible value codec");
+	});
 	it("persists transformed records and reads legacy records through the codec", async () => {
 		const session = randomUUID();
 		const legacy = await openStorage(session);
