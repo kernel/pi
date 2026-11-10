@@ -55,8 +55,8 @@ import { applyPostgresMigrations, DEFAULT_POSTGRES_SCHEMA, quoteIdentifier } fro
 
 type StoredTask = TaskRecord<JsonValue, JsonValue, JsonValue>;
 type TableName = "conversation" | "entry" | "task" | "submission" | "document";
-type JsonRow = { readonly record: string };
-type EntryJsonRow = { readonly record: string; readonly commit_seq: string };
+type JsonRow = { readonly id: string; readonly record: string };
+type EntryJsonRow = JsonRow & { readonly commit_seq: string };
 type MetadataRow = { readonly next_id: string; readonly next_seq: string };
 /** A conversation's own entries over one contiguous id range ending at its newest entry, newest-last. */
 type EntryWindow = { ids: EntryId[]; complete: boolean };
@@ -120,6 +120,21 @@ type Tables = {
 	readonly revisions: string;
 };
 
+/** Identity supplied independently of persisted content to the value codec. */
+export interface PostgresValueAddress {
+	readonly schema: string;
+	readonly session: string;
+	readonly table: "entries" | "tasks" | "submissions" | "document_revisions";
+	readonly id: number;
+	readonly seq?: number;
+}
+
+/** Transforms JSON text at the persistence boundary, never indexed metadata or cached values. */
+export interface PostgresValueCodec {
+	encode(address: PostgresValueAddress, json: string): Promise<string>;
+	decode(address: PostgresValueAddress, json: string): Promise<string>;
+}
+
 export interface PostgresStorageOptions {
 	/** The Session stored by this storage. Sessions in one schema are independent. */
 	readonly session: string;
@@ -131,6 +146,8 @@ export interface PostgresStorageOptions {
 	 * schema-wide lock.
 	 */
 	readonly migrate?: boolean;
+	/** The codec must return valid JSON text and decode legacy values when required. Failures never fall back. */
+	readonly codec?: PostgresValueCodec;
 }
 
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
@@ -244,6 +261,8 @@ export class PostgresStorage implements Storage {
 	private readonly pool: PostgresPool;
 	private readonly session: string;
 	private readonly owner: string;
+	private readonly schema: string;
+	private readonly codec: PostgresValueCodec | undefined;
 	private readonly tables: Tables;
 	private nextId: number;
 	/** The sequence the next commit takes. This storage is the session's only writer, so it advances by one per commit. */
@@ -276,11 +295,20 @@ export class PostgresStorage implements Storage {
 
 	private constructor(
 		pool: PostgresPool,
-		options: { session: string; schema: string; owner: string; nextId: number; nextSeq: number },
+		options: {
+			session: string;
+			schema: string;
+			owner: string;
+			nextId: number;
+			nextSeq: number;
+			codec?: PostgresValueCodec;
+		},
 	) {
 		this.pool = pool;
 		this.session = options.session;
 		this.owner = options.owner;
+		this.schema = options.schema;
+		this.codec = options.codec;
 		this.nextId = options.nextId;
 		this.nextSeq = options.nextSeq;
 		const schema = quoteIdentifier(options.schema);
@@ -319,6 +347,7 @@ export class PostgresStorage implements Storage {
 			owner,
 			nextId: Number(metadata.next_id),
 			nextSeq: Number(metadata.next_seq),
+			codec: options.codec,
 		});
 	}
 
@@ -415,7 +444,7 @@ export class PostgresStorage implements Storage {
 			writes,
 			actions,
 			documents,
-			encoded: this.encodeBatch(writes, documents),
+			encoded: await this.encodeBatch(writes, documents),
 			candidateNextId: this.candidateNextId(writes),
 		};
 	}
@@ -434,7 +463,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	/** The batch as the commit function reads it. Records and content go as JSON text, cast to `json` on insert. */
-	private encodeBatch(writes: readonly StorageWrite[], documents: DocumentWrites): string {
+	private async encodeBatch(writes: readonly StorageWrite[], documents: DocumentWrites): Promise<string> {
 		const claims = new Map<Id<string>, TableName>();
 		const conversations: unknown[] = [];
 		const entries: unknown[] = [];
@@ -457,7 +486,7 @@ export class PostgresStorage implements Storage {
 						id: write.value.id,
 						conversation_id: write.value.conversationId,
 						head: write.value.head ?? null,
-						record: encodeJson(write.value),
+						record: await this.encodeValue("entries", write.value.id, encodeJson(write.value)),
 					});
 					break;
 				case "task":
@@ -469,7 +498,7 @@ export class PostgresStorage implements Storage {
 						status: write.value.state.status,
 						abort_requested: write.value.abortRequested,
 						background: write.value.background,
-						record: encodeJson(write.value),
+						record: await this.encodeValue("tasks", write.value.id, encodeJson(write.value)),
 					});
 					break;
 				case "submission":
@@ -479,7 +508,7 @@ export class PostgresStorage implements Storage {
 						conversation_id: write.value.conversationId,
 						request_id: write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
 						status: write.value.status,
-						record: encodeJson(write.value),
+						record: await this.encodeValue("submissions", write.value.id, encodeJson(write.value)),
 					});
 					break;
 				case "document.create":
@@ -526,7 +555,7 @@ export class PostgresStorage implements Storage {
 			}
 			if (query.ownerTaskId !== undefined) clauses.push(`owner_task_id = $${params.push(query.ownerTaskId)}`);
 			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.conversations} WHERE ${clauses.join(" AND ")}
+				`SELECT id, record::text AS record FROM ${this.tables.conversations} WHERE ${clauses.join(" AND ")}
 					ORDER BY id ${scan.direction} LIMIT $${params.push(limit + 1)}`,
 				params,
 			);
@@ -586,8 +615,8 @@ export class PostgresStorage implements Storage {
 		let stored = this.entries.get(id);
 		if (stored === undefined) {
 			const row = (
-				await this.pool.query<EntryJsonRow>(
-					`SELECT record::text AS record, commit_seq FROM ${this.tables.entries} WHERE session_id = $1 AND id = $2`,
+				await this.entryRows(
+					`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries} WHERE session_id = $1 AND id = $2`,
 					[this.session, id],
 				)
 			).rows[0];
@@ -631,8 +660,8 @@ export class PostgresStorage implements Storage {
 		let ids = this.headMarkers.get(conversationId);
 		if (ids !== undefined) return ids;
 		const rows = (
-			await this.pool.query<EntryJsonRow>(
-				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries}
+			await this.entryRows(
+				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries}
 					WHERE session_id = $1 AND conversation_id = $2 AND head IS NOT NULL ORDER BY id`,
 				[this.session, conversationId],
 			)
@@ -699,9 +728,11 @@ export class PostgresStorage implements Storage {
 			if (lower !== undefined) clauses.push(`id >= $${params.push(lower)}`);
 			if (segment.upper !== undefined) clauses.push(`id <= $${params.push(segment.upper)}`);
 			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
+				`SELECT id, record::text AS record FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
 					ORDER BY id ASC LIMIT $${params.push(limit + 1 - values.length)}`,
 				params,
+				undefined,
+				"entries",
 			);
 			values.push(...rows.map(parseJson<EntryRecord>));
 			if (values.length > limit) break;
@@ -738,8 +769,8 @@ export class PostgresStorage implements Storage {
 		if (dbUpper !== undefined) clauses.push(`id <= $${params.push(dbUpper)}`);
 		const wanted = limit - out.length;
 		const rows = (
-			await this.pool.query<EntryJsonRow>(
-				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
+			await this.entryRows(
+				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
 					ORDER BY id DESC LIMIT $${params.push(wanted)}`,
 				params,
 			)
@@ -763,8 +794,8 @@ export class PostgresStorage implements Storage {
 		let window = this.entryWindows.get(conversationId);
 		if (window !== undefined) return window;
 		const rows = (
-			await this.pool.query<EntryJsonRow>(
-				`SELECT record::text AS record, commit_seq FROM ${this.tables.entries}
+			await this.entryRows(
+				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries}
 					WHERE session_id = $1 AND conversation_id = $2 ORDER BY id DESC LIMIT $3`,
 				[this.session, conversationId, ENTRY_WINDOW_LOAD + 1],
 			)
@@ -885,8 +916,10 @@ export class PostgresStorage implements Storage {
 			const cached = this.tasks.get(id);
 			if (cached !== undefined) return parseJson<StoredTask>(cached);
 			const [record] = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.tasks} WHERE session_id = $1 AND id = $2`,
+				`SELECT id, record::text AS record FROM ${this.tables.tasks} WHERE session_id = $1 AND id = $2`,
 				[this.session, id],
+				undefined,
+				"tasks",
 			);
 			if (record !== undefined) this.tasks.set(id, record);
 			return record === undefined ? undefined : parseJson<StoredTask>(record);
@@ -913,9 +946,11 @@ export class PostgresStorage implements Storage {
 			}
 			if (query.background !== undefined) clauses.push(`background = $${params.push(query.background)}`);
 			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.tasks} WHERE ${clauses.join(" AND ")}
+				`SELECT id, record::text AS record FROM ${this.tables.tasks} WHERE ${clauses.join(" AND ")}
 					ORDER BY id ${scan.direction} LIMIT $${params.push(limit + 1)}`,
 				params,
+				undefined,
+				"tasks",
 			);
 			return page(rows.map(parseJson<StoredTask>), limit, start.order);
 		});
@@ -926,8 +961,10 @@ export class PostgresStorage implements Storage {
 			const cached = this.submissions.get(id);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
 			const [record] = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.submissions} WHERE session_id = $1 AND id = $2`,
+				`SELECT id, record::text AS record FROM ${this.tables.submissions} WHERE session_id = $1 AND id = $2`,
 				[this.session, id],
+				undefined,
+				"submissions",
 			);
 			if (record !== undefined) this.rememberSubmission(record);
 			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
@@ -949,9 +986,11 @@ export class PostgresStorage implements Storage {
 				clauses.push(`conversation_id = $${params.push(query.conversationId)}`);
 			if (query.status !== undefined) clauses.push(`status = $${params.push(query.status)}`);
 			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.submissions} WHERE ${clauses.join(" AND ")}
+				`SELECT id, record::text AS record FROM ${this.tables.submissions} WHERE ${clauses.join(" AND ")}
 					ORDER BY id ${scan.direction} LIMIT $${params.push(limit + 1)}`,
 				params,
+				undefined,
+				"submissions",
 			);
 			return page(rows.map(parseJson<SubmissionRecord>), limit, start.order);
 		});
@@ -969,9 +1008,11 @@ export class PostgresStorage implements Storage {
 			const cached = cachedId === undefined ? undefined : this.submissions.get(cachedId);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
 			const [record] = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.submissions}
+				`SELECT id, record::text AS record FROM ${this.tables.submissions}
 					WHERE session_id = $1 AND conversation_id = $2 AND request_id = $3`,
 				[this.session, conversationId, encodeIndexedString(requestId)],
+				undefined,
+				"submissions",
 			);
 			if (record !== undefined) this.rememberSubmission(record);
 			else this.submissionsByRequest.set(key, null);
@@ -1000,7 +1041,7 @@ export class PostgresStorage implements Storage {
 					? "retired_at IS NULL"
 					: `created_at <= $${params.push(at)} AND (retired_at IS NULL OR retired_at > $${params.length})`;
 			const [record] = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.documents}
+				`SELECT id, record::text AS record FROM ${this.tables.documents}
 					WHERE session_id = $1 AND kind = $2 AND scope_kind = $3 AND owner_id = $4 AND family = $5
 					AND key_value = $6 AND ${alive}
 					ORDER BY created_at DESC LIMIT 1`,
@@ -1069,7 +1110,7 @@ export class PostgresStorage implements Storage {
 			// documents are few.
 			const whole = key !== undefined && after === -1;
 			const rows = await this.records(
-				`SELECT record::text AS record FROM ${this.tables.documents} WHERE ${clauses.join(" AND ")}
+				`SELECT id, record::text AS record FROM ${this.tables.documents} WHERE ${clauses.join(" AND ")}
 					ORDER BY id${whole ? "" : ` LIMIT $${params.push(limit + 1)}`}`,
 				params,
 			);
@@ -1110,13 +1151,53 @@ export class PostgresStorage implements Storage {
 		this.lost ??= error;
 	}
 
-	private async records(sql: string, params: PostgresValue[], executor: PostgresQueryable = this.pool) {
-		return (await executor.query<JsonRow>(sql, params)).rows.map((row) => row.record);
+	private async encodeValue(
+		table: PostgresValueAddress["table"],
+		id: number,
+		json: string,
+		seq?: number,
+	): Promise<string> {
+		return this.codec === undefined
+			? json
+			: this.codec.encode({ schema: this.schema, session: this.session, table, id, seq }, json);
+	}
+
+	private async decodeValue(
+		table: PostgresValueAddress["table"],
+		id: number,
+		json: string,
+		seq?: number,
+	): Promise<string> {
+		return this.codec === undefined
+			? json
+			: this.codec.decode({ schema: this.schema, session: this.session, table, id, seq }, json);
+	}
+
+	private async entryRows(sql: string, params: PostgresValue[]) {
+		const result = await this.pool.query<EntryJsonRow>(sql, params);
+		const rows: EntryJsonRow[] = [];
+		for (const row of result.rows) {
+			rows.push({ ...row, record: await this.decodeValue("entries", Number(row.id), row.record) });
+		}
+		return { ...result, rows };
+	}
+
+	private async records(
+		sql: string,
+		params: PostgresValue[],
+		executor: PostgresQueryable = this.pool,
+		table?: PostgresValueAddress["table"],
+	) {
+		const out: string[] = [];
+		for (const row of (await executor.query<JsonRow>(sql, params)).rows) {
+			out.push(table === undefined ? row.record : await this.decodeValue(table, Number(row.id), row.record));
+		}
+		return out;
 	}
 
 	private async recordById<T>(table: string, id: Id<string>, executor?: PostgresQueryable): Promise<T | undefined> {
 		const [record] = await this.records(
-			`SELECT record::text AS record FROM ${table} WHERE session_id = $1 AND id = $2`,
+			`SELECT id, record::text AS record FROM ${table} WHERE session_id = $1 AND id = $2`,
 			[this.session, id],
 			executor,
 		);
@@ -1167,13 +1248,18 @@ export class PostgresStorage implements Storage {
 					>(row.revisions);
 		const base = revisions[0];
 		if (base === undefined || base.kind !== "base") throw new Error(`Document ${id} is missing a required base`);
-		let value = base.content as JsonObject;
+		let value = parseJson<JsonObject>(
+			await this.decodeValue("document_revisions", id, encodeJson(base.content), base.seq),
+		);
 		const tail = revisions.slice(1);
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version) {
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
 			}
-			value = apply(value, revision.content as unknown as readonly Op[]) as JsonObject;
+			const ops = parseJson<readonly Op[]>(
+				await this.decodeValue("document_revisions", id, encodeJson(revision.content), revision.seq),
+			);
+			value = apply(value, ops) as JsonObject;
 		}
 		return { record, version: base.version, value, deltasSinceBase: tail.length };
 	}
@@ -1320,7 +1406,15 @@ export class PostgresStorage implements Storage {
 				record: created === undefined ? null : encodeJson(created),
 				content_kind: content?.kind ?? null,
 				version: content?.version ?? null,
-				content: content === undefined ? null : encodeJson(content.kind === "base" ? content.value : content.ops),
+				content:
+					content === undefined
+						? null
+						: await this.encodeValue(
+								"document_revisions",
+								id,
+								encodeJson(content.kind === "base" ? content.value : content.ops),
+								seq,
+							),
 			});
 			writes.applied.set(id, { created, retired: action.retire, content });
 		}
