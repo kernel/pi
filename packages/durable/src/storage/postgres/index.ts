@@ -12,4 +12,9 @@ export {
 	POSTGRES_MIGRATIONS,
 	type PostgresMigration,
 } from "./migrations.ts";
-export { PostgresStorage, type PostgresStorageOptions } from "./storage.ts";
+export {
+	PostgresStorage,
+	type PostgresStorageOptions,
+	type PostgresValueAddress,
+	type PostgresValueCodec,
+} from "./storage.ts";

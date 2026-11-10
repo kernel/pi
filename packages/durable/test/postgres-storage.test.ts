@@ -10,6 +10,7 @@ import {
 	applyPostgresMigrations,
 	CURRENT_POSTGRES_SCHEMA_VERSION,
 	PostgresStorage,
+	type PostgresValueCodec,
 } from "../src/storage/postgres/index.ts";
 import type {
 	CommitResult,
@@ -49,8 +50,8 @@ afterAll(async () => {
 	await pool.end();
 });
 
-async function openStorage(session: string = randomUUID()): Promise<PostgresStorage> {
-	const storage = await PostgresStorage.open(pool, { session, schema });
+async function openStorage(session: string = randomUUID(), codec?: PostgresValueCodec): Promise<PostgresStorage> {
+	const storage = await PostgresStorage.open(pool, { session, schema, codec });
 	openStorages.add(storage);
 	return storage;
 }
@@ -60,10 +61,12 @@ class ReopeningStorage implements Storage {
 	private current: PostgresStorage;
 	private readonly session: string;
 	private closed = false;
+	private readonly codec: PostgresValueCodec | undefined;
 
-	constructor(current: PostgresStorage, session: string) {
+	constructor(current: PostgresStorage, session: string, codec?: PostgresValueCodec) {
 		this.current = current;
 		this.session = session;
+		this.codec = codec;
 	}
 
 	async commit(
@@ -76,7 +79,7 @@ class ReopeningStorage implements Storage {
 			return await this.current.commit(batches, receive, commitContext);
 		} finally {
 			await this.current.close(context);
-			this.current = await PostgresStorage.open(pool, { session: this.session, schema });
+			this.current = await PostgresStorage.open(pool, { session: this.session, schema, codec: this.codec });
 		}
 	}
 
@@ -136,6 +139,120 @@ registerStorageConformance({ describe: describePostgres, expect, it }, "Postgres
 	} finally {
 		await storage.close(context);
 	}
+});
+
+const testCodec: PostgresValueCodec = {
+	async encode(address, json) {
+		return JSON.stringify(Buffer.from(JSON.stringify({ address, json })).toString("base64"));
+	},
+	async decode(address, json) {
+		const stored = JSON.parse(json) as unknown;
+		if (typeof stored !== "string") return json;
+		const decoded = JSON.parse(Buffer.from(stored, "base64").toString()) as { address: unknown; json: string };
+		expect(decoded.address).toEqual(address);
+		return decoded.json;
+	},
+};
+
+registerStorageConformance(
+	{ describe: describePostgres, expect, it },
+	"PostgresStorage codec across reopen",
+	async (use) => {
+		const session = randomUUID();
+		const storage = new ReopeningStorage(await openStorage(session, testCodec), session, testCodec);
+		try {
+			await use(storage);
+		} finally {
+			await storage.close(context);
+		}
+	},
+);
+
+describePostgres("Postgres value codec", () => {
+	it("does not retain a stale entry window when a commit overlaps decoding", async () => {
+		const session = randomUUID();
+		const first = await openStorage(session, testCodec);
+		await createRoot(first);
+		const oldId = await first.mintId<EntryId>();
+		await commitWrites(first, [message(oldId)], context);
+		await first.close(context);
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let blocked = false;
+		const storage = await openStorage(session, {
+			...testCodec,
+			async decode(address, json) {
+				if (address.table === "entries" && !blocked) {
+					blocked = true;
+					enter();
+					await released;
+					await new Promise<void>((resolve) => setTimeout(resolve, 0));
+				}
+				return testCodec.decode(address, json);
+			},
+		});
+		const reading = storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		await entered;
+		const newId = await storage.mintId<EntryId>();
+		await commitWrites(storage, [message(newId)], context);
+		const during = await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		expect(during.items.map((entry) => entry.id)).toContain(newId);
+		release();
+		await reading;
+		const after = await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		expect(after.items.map((entry) => entry.id)).toContain(newId);
+	});
+
+	it("rejects encoded records without a decoder", async () => {
+		const session = randomUUID();
+		const first = await openStorage(session, testCodec);
+		await createRoot(first);
+		const id = await first.mintId<EntryId>();
+		await commitWrites(first, [message(id)], context);
+		await first.close(context);
+		const plain = await openStorage(session);
+		await expect(plain.entry(id, context)).rejects.toThrow("compatible value codec");
+	});
+	it("persists transformed records and reads legacy records through the codec", async () => {
+		const session = randomUUID();
+		const legacy = await openStorage(session);
+		await createRoot(legacy);
+		const first = await legacy.mintId<EntryId>();
+		await commitWrites(legacy, [message(first)], context);
+		await legacy.close(context);
+		const encrypted = await openStorage(session, testCodec);
+		expect((await encrypted.entry(first, context))?.entry.id).toBe(first);
+		const second = await encrypted.mintId<EntryId>();
+		await commitWrites(encrypted, [message(second)], context);
+		const rows = await pool.query(
+			`SELECT json_typeof(record) AS type FROM "${schema}".entries WHERE session_id=$1 ORDER BY id`,
+			[session],
+		);
+		expect(rows.rows.map((row) => row.type)).toEqual(["object", "string"]);
+	});
+
+	it("does not write plaintext when encoding fails", async () => {
+		const session = randomUUID();
+		const storage = await openStorage(session, {
+			...testCodec,
+			async encode() {
+				throw new Error("codec unavailable");
+			},
+		});
+		await createRoot(storage);
+		const id = await storage.mintId<EntryId>();
+		const result = await storage.commit([[message(id)]], () => {}, context);
+		expect(result.stored).toBe(0);
+		expect(result.refused).toBeDefined();
+		const rows = await pool.query(`SELECT id FROM "${schema}".entries WHERE session_id=$1`, [session]);
+		expect(rows.rows).toEqual([]);
+	});
 });
 
 async function createRoot(storage: Storage): Promise<Seq> {
