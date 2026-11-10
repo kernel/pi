@@ -537,7 +537,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	conversation(id: ConversationId, _context: Context): Promise<ConversationRecord | undefined> {
-		return this.readCached(() => this.readConversation(id));
+		return this.admit(() => this.readConversation(id));
 	}
 
 	scanConversations(
@@ -546,7 +546,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<ConversationRecord, Cursor>> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -575,7 +575,7 @@ export class PostgresStorage implements Storage {
 		idOrContext: EntryId | Context,
 		context?: Context,
 	): Promise<{ readonly entry: EntryRecord; readonly commitSeq: Seq } | undefined> {
-		return this.readCached(() => this.readEntry(idOrConversationId, idOrContext, context));
+		return this.admit(() => this.readEntry(idOrConversationId, idOrContext, context));
 	}
 
 	findLatestHeadMarker(
@@ -583,7 +583,7 @@ export class PostgresStorage implements Storage {
 		atOrBeforeEntryId: EntryId | undefined,
 		_context: Context,
 	): Promise<(EntryRecord & { readonly head: EntryId }) | undefined> {
-		return this.readCached(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
+		return this.admit(() => this.readLatestHeadMarker(conversationId, atOrBeforeEntryId));
 	}
 
 	scanEntries(
@@ -592,7 +592,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<EntryRecord, Cursor>> {
-		return this.readCached(() => this.readEntries(query, limit, cursor));
+		return this.admit(() => this.readEntries(query, limit, cursor));
 	}
 
 	private async readEntry(
@@ -660,6 +660,7 @@ export class PostgresStorage implements Storage {
 	private async headMarkerIds(conversationId: ConversationId): Promise<EntryId[]> {
 		let ids = this.headMarkers.get(conversationId);
 		if (ids !== undefined) return ids;
+		const epoch = this.commitEpoch;
 		const rows = (
 			await this.entryRows(
 				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries}
@@ -673,7 +674,7 @@ export class PostgresStorage implements Storage {
 			this.entries.set(entry.id, { record: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) });
 			ids.push(entry.id);
 		}
-		this.headMarkers.set(conversationId, ids);
+		if (this.cacheCurrent(epoch)) this.headMarkers.set(conversationId, ids);
 		return ids;
 	}
 
@@ -769,6 +770,7 @@ export class PostgresStorage implements Storage {
 		if (min !== undefined) clauses.push(`id >= $${params.push(min)}`);
 		if (dbUpper !== undefined) clauses.push(`id <= $${params.push(dbUpper)}`);
 		const wanted = limit - out.length;
+		const epoch = this.commitEpoch;
 		const rows = (
 			await this.entryRows(
 				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries} WHERE ${clauses.join(" AND ")}
@@ -777,7 +779,7 @@ export class PostgresStorage implements Storage {
 			)
 		).rows;
 		const fetched = rows.map((row) => ({ entry: parseJson<EntryRecord>(row.record), row }));
-		if (belowWindow) {
+		if (belowWindow && this.cacheCurrent(epoch) && this.entryWindows.get(conversationId) === window) {
 			// Contiguous with the window: keep these so a later scan of the same range needs no read. Fewer rows
 			// than asked for, with no lower bound cutting them off, means the conversation starts here.
 			for (const { entry, row } of fetched) {
@@ -794,6 +796,7 @@ export class PostgresStorage implements Storage {
 	private async entryWindow(conversationId: ConversationId): Promise<EntryWindow> {
 		let window = this.entryWindows.get(conversationId);
 		if (window !== undefined) return window;
+		const epoch = this.commitEpoch;
 		const rows = (
 			await this.entryRows(
 				`SELECT id, record::text AS record, commit_seq FROM ${this.tables.entries}
@@ -808,7 +811,7 @@ export class PostgresStorage implements Storage {
 			ids.push(entry.id);
 		}
 		window = { ids, complete: rows.length <= ENTRY_WINDOW_LOAD };
-		this.entryWindows.set(conversationId, window);
+		if (this.cacheCurrent(epoch)) this.entryWindows.set(conversationId, window);
 		return window;
 	}
 
@@ -914,16 +917,17 @@ export class PostgresStorage implements Storage {
 	}
 
 	task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const cached = this.tasks.get(id);
 			if (cached !== undefined) return parseJson<StoredTask>(cached);
+			const epoch = this.commitEpoch;
 			const [record] = await this.records(
 				`SELECT id, record::text AS record FROM ${this.tables.tasks} WHERE session_id = $1 AND id = $2`,
 				[this.session, id],
 				undefined,
 				"tasks",
 			);
-			if (record !== undefined) this.tasks.set(id, record);
+			if (record !== undefined && this.cacheCurrent(epoch)) this.tasks.set(id, record);
 			return record === undefined ? undefined : parseJson<StoredTask>(record);
 		});
 	}
@@ -934,7 +938,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<StoredTask, Cursor>> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -959,16 +963,17 @@ export class PostgresStorage implements Storage {
 	}
 
 	submission(id: SubmissionId, _context: Context): Promise<SubmissionRecord | undefined> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const cached = this.submissions.get(id);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
+			const epoch = this.commitEpoch;
 			const [record] = await this.records(
 				`SELECT id, record::text AS record FROM ${this.tables.submissions} WHERE session_id = $1 AND id = $2`,
 				[this.session, id],
 				undefined,
 				"submissions",
 			);
-			if (record !== undefined) this.rememberSubmission(record);
+			if (record !== undefined && this.cacheCurrent(epoch)) this.rememberSubmission(record);
 			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
 		});
 	}
@@ -979,7 +984,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<SubmissionRecord, Cursor>> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const start = scanStart(query.order, cursor, "ascending");
 			const scan = scanSql(start);
 			const params: PostgresValue[] = [this.session];
@@ -1003,12 +1008,13 @@ export class PostgresStorage implements Storage {
 		requestId: string,
 		_context: Context,
 	): Promise<SubmissionRecord | undefined> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const key = requestKey(conversationId, requestId);
 			const cachedId = this.submissionsByRequest.get(key);
 			if (cachedId === null) return undefined;
 			const cached = cachedId === undefined ? undefined : this.submissions.get(cachedId);
 			if (cached !== undefined) return parseJson<SubmissionRecord>(cached);
+			const epoch = this.commitEpoch;
 			const [record] = await this.records(
 				`SELECT id, record::text AS record FROM ${this.tables.submissions}
 					WHERE session_id = $1 AND conversation_id = $2 AND request_id = $3`,
@@ -1016,14 +1022,16 @@ export class PostgresStorage implements Storage {
 				undefined,
 				"submissions",
 			);
-			if (record !== undefined) this.rememberSubmission(record);
-			else this.submissionsByRequest.set(key, null);
+			if (this.cacheCurrent(epoch)) {
+				if (record !== undefined) this.rememberSubmission(record);
+				else this.submissionsByRequest.set(key, null);
+			}
 			return record === undefined ? undefined : parseJson<SubmissionRecord>(record);
 		});
 	}
 
 	findDocument(address: DocumentAddress, at: DocumentPoint, _context: Context): Promise<DocumentRecord | undefined> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const key = at === "current" ? addressKey(address) : undefined;
 			if (key !== undefined) {
 				const cached = this.documentAddresses.get(key);
@@ -1042,6 +1050,7 @@ export class PostgresStorage implements Storage {
 				at === "current"
 					? "retired_at IS NULL"
 					: `created_at <= $${params.push(at)} AND (retired_at IS NULL OR retired_at > $${params.length})`;
+			const epoch = this.commitEpoch;
 			const [record] = await this.records(
 				`SELECT id, record::text AS record FROM ${this.tables.documents}
 					WHERE session_id = $1 AND kind = $2 AND scope_kind = $3 AND owner_id = $4 AND family = $5
@@ -1049,13 +1058,14 @@ export class PostgresStorage implements Storage {
 					ORDER BY created_at DESC LIMIT 1`,
 				params,
 			);
-			if (key !== undefined && record !== undefined) this.documentAddresses.set(key, record);
+			if (key !== undefined && record !== undefined && this.cacheCurrent(epoch))
+				this.documentAddresses.set(key, record);
 			return record === undefined ? undefined : parseJson<DocumentRecord>(record);
 		});
 	}
 
 	document(id: DocumentId, at: DocumentPoint, _context: Context): Promise<StoredDocument | undefined> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			if (at === "current") {
 				const state = this.documentStates.get(id);
 				if (state !== undefined) {
@@ -1067,8 +1077,9 @@ export class PostgresStorage implements Storage {
 					};
 				}
 			}
+			const epoch = this.commitEpoch;
 			const stored = await this.materializeDocument(id, at);
-			if (at === "current" && stored !== undefined) {
+			if (at === "current" && stored !== undefined && this.cacheCurrent(epoch)) {
 				this.documentStates.set(id, {
 					record: encodeJson(stored.record),
 					version: stored.version,
@@ -1086,7 +1097,7 @@ export class PostgresStorage implements Storage {
 		cursor: Cursor | undefined,
 		_context: Context,
 	): Promise<Page<DocumentRecord, Cursor>> {
-		return this.readCached(async () => {
+		return this.admit(async () => {
 			const scope = scopeColumns(query.scope);
 			const after = cursorId(cursor) ?? -1;
 			const key = query.at === "current" ? `${scope.scopeKind}:${scope.ownerId}:${query.kind ?? ""}` : undefined;
@@ -1111,12 +1122,13 @@ export class PostgresStorage implements Storage {
 			// A current scan is cached whole: it is read from its start without a page limit, and a scope's live
 			// documents are few.
 			const whole = key !== undefined && after === -1;
+			const epoch = this.commitEpoch;
 			const rows = await this.records(
 				`SELECT id, record::text AS record FROM ${this.tables.documents} WHERE ${clauses.join(" AND ")}
 					ORDER BY id${whole ? "" : ` LIMIT $${params.push(limit + 1)}`}`,
 				params,
 			);
-			if (whole) this.documentScans.set(key!, rows);
+			if (whole && this.cacheCurrent(epoch)) this.documentScans.set(key!, rows);
 			return page(rows.slice(0, limit + 1).map(parseJson<DocumentRecord>), limit);
 		});
 	}
@@ -1149,28 +1161,8 @@ export class PostgresStorage implements Storage {
 		}
 	}
 
-	private readCached<T>(operation: () => Promise<T>): Promise<T> {
-		return this.admit(async () => {
-			const epoch = this.commitEpoch;
-			try {
-				return await operation();
-			} finally {
-				if (epoch !== this.commitEpoch) {
-					// A commit can be absorbed while the codec awaits keys. Discard that
-					// read's stale cache writes; the next read reloads committed state.
-					this.conversations.clear();
-					this.tasks.clear();
-					this.submissions.clear();
-					this.submissionsByRequest.clear();
-					this.entries.clear();
-					this.entryWindows.clear();
-					this.headMarkers.clear();
-					this.documentStates.clear();
-					this.documentScans.clear();
-					this.documentAddresses.clear();
-				}
-			}
-		});
+	private cacheCurrent(epoch: number): boolean {
+		return this.codec === undefined || epoch === this.commitEpoch;
 	}
 
 	private loseOwnership(error: Error): void {

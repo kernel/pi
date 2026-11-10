@@ -201,6 +201,8 @@ describePostgres("Postgres value codec", () => {
 		await entered;
 		const newId = await storage.mintId<EntryId>();
 		await commitWrites(storage, [message(newId)], context);
+		const during = await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
+		expect(during.items.map((entry) => entry.id)).toContain(newId);
 		release();
 		await reading;
 		const after = await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 10, undefined, context);
