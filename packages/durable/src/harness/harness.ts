@@ -227,6 +227,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 			options.setTimer,
 			options.readOnly === true,
 			() => hostSettings()?.progress?.persistWithinMs,
+			options.validateValue,
 		);
 		// Every component reads and writes through the Session's failure guard: `rawStorage` serves only `super()`.
 		const storage = this.storage;

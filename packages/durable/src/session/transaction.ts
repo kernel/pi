@@ -122,6 +122,7 @@ export type AdoptedDocuments = {
 export interface TransactionHost {
 	/** Reads wait while their key has an unpublished writer (`GatedStorage`). */
 	readonly storage: Storage;
+	readonly validateValue?: (value: unknown) => void;
 	/** Wait while `key` has an unpublished writer; `undefined` when it has none. */
 	touch(key: string): Promise<void> | undefined;
 	/** Wall clock for task lifecycle times. */
@@ -779,7 +780,24 @@ export class Transaction implements Tx {
 			for (const document of this.#documents) {
 				if (document.change !== undefined) document.prepared = document.change.prepare();
 			}
-			return await this.#assemble();
+			const writes = await this.#assemble();
+			if (this.#host.validateValue !== undefined) {
+				for (const write of writes) {
+					if ("value" in write) this.#host.validateValue(write.value);
+					else if ("content" in write) {
+						this.#host.validateValue(write.content.kind === "base" ? write.content.value : write.content.ops);
+					} else if (write.type === "document.copy") {
+						const source = await this.#host.storage.document(write.source.id, write.source.at, this.#context);
+						if (source !== undefined) this.#host.validateValue(source.value);
+					}
+				}
+				// A valid delta must not grow a document that its next base checkpoint cannot store.
+				for (const plan of this.#plans) {
+					if (plan.content !== undefined && plan.change !== undefined)
+						this.#host.validateValue(plan.change.prepared.value);
+				}
+			}
+			return writes;
 		} catch (error) {
 			this.#abortChanges();
 			throw error;
@@ -862,7 +880,13 @@ export class Transaction implements Tx {
 			const own = plan.content?.type === "document.change" ? plan.content : undefined;
 			const change = plan.change;
 			const value = change?.prepared.value ?? hold.loaded.tracker.value;
-			const stored = storeHeld(hold, change?.prepared.ops ?? EMPTY_OPERATIONS, value, hold.loaded.valueVersion);
+			const stored = storeHeld(
+				hold,
+				change?.prepared.ops ?? EMPTY_OPERATIONS,
+				value,
+				hold.loaded.valueVersion,
+				this.#host.validateValue,
+			);
 			// A base this commit selected or must write covers what was held.
 			const content = own?.content.kind === "base" ? own.content : stored.content;
 			const write = { type: "document.change", id: plan.record.id, content } as const;
@@ -1275,11 +1299,20 @@ export function storeHeld(
 	ops: readonly Op[],
 	value: JsonObject,
 	version: number,
+	validateValue?: (value: unknown) => void,
 ): { readonly content: DocumentContent; readonly ops: readonly Op[] } {
 	hold.pending.push(ops);
 	const taken = hold.pending.take();
 	if (taken.kind === "replace") return { content: { version, kind: "base", value }, ops: [["r", value]] };
 	if (hold.base) return { content: { version, kind: "base", value }, ops: taken.ops };
+	if (validateValue !== undefined) {
+		try {
+			validateValue(taken.ops);
+		} catch {
+			validateValue(value);
+			return { content: { version, kind: "base", value }, ops: [["r", value]] };
+		}
+	}
 	return { content: { version, kind: "delta", ops: taken.ops }, ops: taken.ops };
 }
 
