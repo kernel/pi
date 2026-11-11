@@ -147,6 +147,8 @@ export function createSession(
 		readonly setTimer?: SetTimer;
 		/** Default `withinMs` of a deferred commit (`CommitPersistence`); default 1,000. */
 		readonly persistWithinMs?: number;
+		/** Pure admission check for new records and document values; a throw rejects only the transaction. */
+		readonly validateValue?: (value: unknown) => void;
 	},
 ): Session {
 	const retention = options?.documentRetentionMs;
@@ -158,6 +160,7 @@ export function createSession(
 		options?.setTimer,
 		false,
 		() => within,
+		options?.validateValue,
 	);
 }
 
@@ -237,6 +240,7 @@ export class SessionImpl implements Session {
 	#holdTimer: HoldTimer | undefined;
 	/** Refuse every commit with writes (`HarnessOptions.readOnly`). */
 	readonly #readOnly: boolean;
+	readonly #validateValue: ((value: unknown) => void) | undefined;
 	readonly #timers: Timers;
 	/** The pending eviction: a timer for the oldest idle document, or a line job when the retention is 0. */
 	#documentSweep: { readonly at: number; disarm: (() => void) | undefined } | undefined;
@@ -297,10 +301,12 @@ export class SessionImpl implements Session {
 		setTimer?: SetTimer,
 		readOnly = false,
 		persistWithinMs: () => number | undefined = () => undefined,
+		validateValue?: (value: unknown) => void,
 	) {
 		// Waits race it; none has to.
 		this.#failed.promise.catch(() => {});
 		this.#readOnly = readOnly;
+		this.#validateValue = validateValue;
 		// A read-only Session shows a Storage another process writes, so nothing it reads stays current.
 		this.#cached = readOnly ? undefined : new CachedStorage(storage);
 		this.#storage = new GuardedStorage(this.#cached ?? storage, this);
@@ -343,6 +349,7 @@ export class SessionImpl implements Session {
 		};
 		this.#host = {
 			storage: this.#gated,
+			validateValue,
 			touch: (key) => this.touch(key),
 			now,
 			cached: (id) => {
@@ -1263,7 +1270,7 @@ export class SessionImpl implements Session {
 		for (const hold of holds) {
 			const { record, tracker, valueVersion: version } = hold.loaded;
 			const value = tracker.value;
-			const stored = storeHeld(hold, NO_OPERATIONS, value, version);
+			const stored = storeHeld(hold, NO_OPERATIONS, value, version, this.#validateValue);
 			writes.push({ type: "document.change", id: record.id, content: stored.content });
 			keys.push(documentKey(hold.loaded.addressId), incarnationKey(record.id));
 			// Held documents are conversation documents.

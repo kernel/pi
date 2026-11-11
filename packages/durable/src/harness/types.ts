@@ -745,6 +745,12 @@ export type HarnessOptions<Tool extends ToolRegistration = ToolRegistration> = {
 	 * without it to write.
 	 */
 	readonly readOnly?: boolean;
+	/**
+	 * Pure, synchronous admission check for new records, document values and encoded deltas. Must not mutate its input
+	 * or call the Harness. A throw rejects the transaction before storage or publication, without failing the Session.
+	 * Deferred deltas that exceed the policy when folded are stored as their already-validated full value instead.
+	 */
+	readonly validateValue?: (value: unknown) => void;
 };
 
 /**
